@@ -72,6 +72,31 @@ def test_build_from_template_rejects_short_bin():
         raise AssertionError("expected XcalError for too-small bin")
 
 
+def test_efi_bin_layout_roundtrip():
+    # Synthetic module with a low boot region, a high calibration bank at
+    # 0x840000, and a 16-byte id block at 0x2000000 (like a real CM24xx).
+    image = bytearray([0xFF]) * (0x2000000 + 0x10)
+    for i in range(0x1080, 0x1100):
+        image[i] = i & 0xFF
+    for i in range(0x840000, 0x840800):
+        image[i] = (i * 7) & 0xFF
+    for i in range(0x2000000, 0x2000010):
+        image[i] = (i * 3) & 0xFF
+    runs = [(0x1080, 0x80), (0x840000, 0x800), (0x2000000, 0x10)]
+    blob, _ = _make_xcal(bytes(image), runs, token="9752")
+    x = xcalfmt.parse(blob)
+
+    efi = xcalfmt.to_efi_bin(x)
+    # calibration bank shifted down by 0x7C0000: 0x840000 -> 0x80000
+    assert efi[0x80000:0x80008] == x.image[0x840000:0x840008]
+    assert efi[0x1080:0x1088] == x.image[0x1080:0x1088]
+    # much smaller than the 32MB flat image
+    assert len(efi) < len(x.image)
+
+    # _efi.bin + template .xcal rebuilds the exact original .xcal
+    assert xcalfmt.efi_bin_to_xcal(efi, blob) == blob
+
+
 def test_header_fields_parsed():
     blob, _ = _make_xcal(b"\xFF" * 0x40, [(0x0, 0x10)])
     x = xcalfmt.parse(blob)

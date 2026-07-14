@@ -55,11 +55,19 @@ class XcalBinTab(ttk.Frame):
         ttk.Button(actions, text="bin -> xcal (use .xcal template)",
                    command=self.bin_to_xcal_template).pack(side="left")
 
+        efi = ttk.Frame(self)
+        efi.pack(fill="x")
+        ttk.Button(efi, text="xcal -> EFILive _efi.bin",
+                   command=self.xcal_to_efi).pack(side="left")
+        ttk.Button(efi, text="_efi.bin -> xcal (use .xcal template)",
+                   command=self.efi_to_xcal).pack(side="left", padx=6)
+
         ttk.Label(
             self,
-            text="bin -> xcal needs the .xcalmeta sidecar saved when you extracted "
-                 "the bin. No sidecar? Use 'template' and pick the matching "
-                 "original .xcal to wrap the bin.",
+            text="'xcal -> bin' extracts the flat flash image. 'xcal -> EFILive "
+                 "_efi.bin' matches EFILive's compacted layout (the smaller file "
+                 "you flash/edit). bin -> xcal needs the .xcalmeta sidecar, or use "
+                 "a 'template' button and pick the matching original .xcal.",
             foreground="#555", wraplength=720, justify="left",
         ).pack(anchor="w")
 
@@ -194,6 +202,68 @@ class XcalBinTab(ttk.Frame):
         with open(out, "wb") as fh:
             fh.write(blob)
         messagebox.showinfo("Done", f"Wrote {len(blob):,} bytes to\n{out}")
+
+    def xcal_to_efi(self):
+        if not self._data:
+            messagebox.showinfo("xcaltool", "Open the .xcal first.")
+            return
+        if not xcalfmt.is_xcal(self._data):
+            messagebox.showinfo("xcaltool", "Open an .xcal (not a .bin) first.")
+            return
+        try:
+            x = xcalfmt.parse(self._data)
+            efi = xcalfmt.to_efi_bin(x)
+        except xcalfmt.XcalError as exc:
+            messagebox.showerror("Conversion failed", str(exc))
+            return
+        out = filedialog.asksaveasfilename(
+            defaultextension=".bin",
+            initialfile="output_efi.bin",
+            filetypes=[("bin file", "*.bin")],
+        )
+        if not out:
+            return
+        with open(out, "wb") as fh:
+            fh.write(efi)
+        messagebox.showinfo("Done", f"Wrote {len(efi):,} bytes (EFILive layout) to\n{out}")
+
+    def efi_to_xcal(self):
+        if not self._data:
+            messagebox.showinfo("xcaltool", "Open the _efi.bin first (Open button).")
+            return
+        if xcalfmt.is_xcal(self._data):
+            messagebox.showinfo(
+                "xcaltool",
+                "The open file is already an .xcal. Open the _efi.bin, then use "
+                "this and pick the matching template .xcal.",
+            )
+            return
+        tpl_path = filedialog.askopenfilename(
+            title="Pick the matching original .xcal (template)",
+            filetypes=[("xcal file", "*.xcal"), ("All files", "*.*")],
+        )
+        if not tpl_path:
+            return
+        try:
+            with open(tpl_path, "rb") as fh:
+                template = fh.read()
+            blob = xcalfmt.efi_bin_to_xcal(self._data, template)
+        except (xcalfmt.XcalError, ValueError) as exc:
+            messagebox.showerror("Conversion failed", str(exc))
+            return
+        out = filedialog.asksaveasfilename(
+            defaultextension=".xcal", filetypes=[("xcal file", "*.xcal")]
+        )
+        if not out:
+            return
+        with open(out, "wb") as fh:
+            fh.write(blob)
+        messagebox.showinfo(
+            "Done",
+            f"Wrote {len(blob):,} bytes to\n{out}\n\n"
+            "Note: the template's 4-char token was reused as-is; if you changed "
+            "bytes EFILive may need to re-accept the file.",
+        )
 
     def open_ecfg(self):
         path = filedialog.askopenfilename(

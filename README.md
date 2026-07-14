@@ -6,7 +6,12 @@ Calterm/INSITE calibration files.
 ## What it does
 
 - **xcal ↔ bin** – convert `.xcal` calibration containers to raw `.bin` flash
-  images and back (lossless round-trip via a `.xcalmeta` sidecar).
+  images and back (lossless round-trip via a `.xcalmeta` sidecar, or by picking
+  the original `.xcal` as a template).
+- **xcal ↔ EFILive `_efi.bin`** – produce EFILive's compacted `_efi.bin` layout
+  (the smaller file you flash/edit) and rebuild the `.xcal` from it. The high
+  calibration bank (0x840000+) is shifted down by 0x7C0000 so the file stays a
+  sensible size instead of a 32 MB flat image. Verified byte-exact on CM24xx.
 - **ecfg → xdf/csv** – turn a Cummins `.ecfg` definition into a TunerPro `.xdf`
   or a `.csv` table.
 - **DTC catalog** – from an `.ecfg`, list the fault-code / diagnostic parameters,

@@ -229,6 +229,79 @@ def bin_to_xcal(image: bytes, meta: dict) -> bytes:
     return build(image, meta)
 
 
+# ---------------------------------------------------------------------------
+# EFILive *_efi.bin* layout
+# ---------------------------------------------------------------------------
+#
+# EFILive's ``xcal -> bin`` does not emit the flat base-0 image; on modules with
+# a high calibration bank it *compacts* the address space so the file stays a
+# sensible size. Reverse-engineered from real matched pairs, the mapping is:
+#
+#   * segments below 0x800000 (boot / OS)      -> same offset
+#   * the calibration bank at 0x840000+        -> shifted down by 0x7C0000
+#     (so flash 0x840000 lands at file 0x80000)
+#   * a small trailing id block at 0x2000000   -> placed on the next 0x1000
+#     boundary after the calibration data
+#   * total size padded up to a 0x2000 boundary, gaps filled with 0xFF
+#
+# Verified byte-exact on CM24xx. Simpler CM22xx/CM23xx modules keep everything
+# below 0x800000 so their _efi.bin is effectively the flat image.
+
+CAL_BANK_BASE = 0x840000
+CAL_BANK_EFI = 0x80000
+CAL_SHIFT = CAL_BANK_BASE - CAL_BANK_EFI    # 0x7C0000
+ID_BLOCK_BASE = 0x2000000
+
+
+def _align_up(value: int, boundary: int) -> int:
+    return (value + boundary - 1) // boundary * boundary
+
+
+def _efi_layout(runs: List[Run]) -> Tuple[List[Tuple[int, int, int]], int]:
+    """Return ([(flash_addr, length, efi_offset), ...], total_size)."""
+    placed: List[Tuple[int, int, int]] = []
+    cal_end = 0
+    idblock: Tuple[int, int] = ()
+    for start, length in runs:
+        if start >= ID_BLOCK_BASE:
+            idblock = (start, length)
+            continue
+        dst = start if start < CAL_BANK_BASE else start - CAL_SHIFT
+        placed.append((start, length, dst))
+        cal_end = max(cal_end, dst + length)
+    end = cal_end
+    if idblock:
+        dst = _align_up(cal_end, 0x1000)
+        placed.append((idblock[0], idblock[1], dst))
+        end = dst + idblock[1]
+    return placed, _align_up(end, 0x2000)
+
+
+def to_efi_bin(x: XcalFile) -> bytes:
+    """Build an EFILive-style ``*_efi.bin`` from a parsed .xcal."""
+    placed, size = _efi_layout(x.runs)
+    out = bytearray([FILL_BYTE]) * size
+    for addr, length, dst in placed:
+        out[dst:dst + length] = x.image[addr:addr + length]
+    return bytes(out)
+
+
+def efi_bin_to_xcal(efi: bytes, template_xcal: bytes) -> bytes:
+    """Rebuild the original .xcal from an EFILive ``*_efi.bin`` plus the matching
+    .xcal as a template (for header, token and the coverage/run layout)."""
+    tpl = parse(template_xcal)
+    placed, size = _efi_layout(tpl.runs)
+    if len(efi) < size:
+        raise XcalError(
+            f"this .bin is 0x{len(efi):X} bytes but the template's EFILive "
+            f"layout needs 0x{size:X}; wrong template or not an _efi.bin."
+        )
+    image = bytearray([FILL_BYTE]) * len(tpl.image)
+    for addr, length, dst in placed:
+        image[addr:addr + length] = efi[dst:dst + length]
+    return build(bytes(image), tpl.meta())
+
+
 def build_from_template(image: bytes, template_xcal: bytes) -> bytes:
     """Wrap a raw ``image`` (.bin) into an .xcal using an existing .xcal as a
     template for the header, token, and coverage layout.
