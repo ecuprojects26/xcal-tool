@@ -17,7 +17,7 @@ from tkinter import filedialog, messagebox, ttk
 
 import json
 
-from . import __version__, dtc, ecfg, xcalfmt
+from . import __version__, dtc, ecfg, faultcodes, xcalfmt
 from .comms import NotConnectedBackend
 
 
@@ -307,6 +307,96 @@ class DtcTab(ttk.Frame):
         messagebox.showinfo("Done", f"Wrote {out}")
 
 
+class FaultCodeTab(ttk.Frame):
+    """Import the Cummins service fault-code .xls and search/export it."""
+
+    def __init__(self, master):
+        super().__init__(master, padding=10)
+        self._records = []
+
+        top = ttk.Frame(self)
+        top.pack(fill="x")
+        ttk.Button(top, text="Import fault-code .xls...",
+                   command=self.import_xls).pack(side="left")
+        ttk.Button(top, text="Open fault-code .csv...",
+                   command=self.open_csv).pack(side="left", padx=6)
+        ttk.Button(top, text="Export CSV...",
+                   command=self.export_csv).pack(side="left")
+        self.file_lbl = ttk.Label(top, text="No fault-code table loaded")
+        self.file_lbl.pack(side="left", padx=10)
+
+        search = ttk.Frame(self)
+        search.pack(fill="x", pady=8)
+        ttk.Label(search, text="Find (fault code / SPN / text):").pack(side="left")
+        self.query = tk.StringVar()
+        ent = ttk.Entry(search, textvariable=self.query, width=30)
+        ent.pack(side="left", padx=6)
+        ent.bind("<Return>", lambda _e: self.search())
+        ttk.Button(search, text="Search", command=self.search).pack(side="left")
+
+        self.report = tk.Text(self, height=18, wrap="none", font=("Courier", 9))
+        self.report.pack(fill="both", expand=True, pady=8)
+
+    def _loaded(self, n):
+        self.file_lbl.config(text=f"{n:,} fault codes loaded")
+        self.report.delete("1.0", "end")
+        self.report.insert("1.0", "Loaded. Type a fault code, SPN, or text and Search.")
+
+    def import_xls(self):
+        path = filedialog.askopenfilename(
+            title="Import Cummins service fault-code .xls",
+            filetypes=[("Excel", "*.xls *.xlsx"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            self._records = faultcodes.import_xls(path)
+        except RuntimeError as exc:
+            messagebox.showerror("Import failed", str(exc))
+            return
+        self._loaded(len(self._records))
+
+    def open_csv(self):
+        path = filedialog.askopenfilename(
+            title="Open fault-code .csv", filetypes=[("CSV", "*.csv")]
+        )
+        if not path:
+            return
+        self._records = faultcodes.load_csv(path)
+        self._loaded(len(self._records))
+
+    def export_csv(self):
+        if not self._records:
+            messagebox.showinfo("xcaltool", "Import an .xls or open a .csv first.")
+            return
+        out = filedialog.asksaveasfilename(defaultextension=".csv")
+        if not out:
+            return
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write(faultcodes.to_csv(self._records))
+        messagebox.showinfo("Done", f"Wrote {out}")
+
+    def search(self):
+        if not self._records:
+            messagebox.showinfo("xcaltool", "Import an .xls or open a .csv first.")
+            return
+        q = self.query.get().strip().lower()
+        hits = [
+            r for r in self._records
+            if not q or q in r.fault_code.lower() or q in r.spn.lower()
+            or q in r.description.lower()
+        ][:500]
+        lines = [f"{'FC':>6} {'SPN':>6} {'FMI':>4} {'Pcode':>6} {'Lamp':6} Description",
+                 "-" * 90]
+        for r in hits:
+            lines.append(f"{r.fault_code:>6} {r.spn:>6} {r.j1939_fmi:>4} "
+                         f"{r.pcode:>6} {r.lamp_color:6} {r.description[:60]}")
+        lines.append("")
+        lines.append(f"{len(hits)} match(es)" + (" (showing first 500)" if len(hits) == 500 else ""))
+        self.report.delete("1.0", "end")
+        self.report.insert("1.0", "\n".join(lines))
+
+
 class EcuTab(ttk.Frame):
     """Placeholder tab for future ECU read/write."""
 
@@ -339,6 +429,7 @@ class App(tk.Tk):
         nb.add(XcalBinTab(nb), text="xcal <-> bin")
         nb.add(EcfgTab(nb), text="ecfg -> xdf/csv")
         nb.add(DtcTab(nb), text="DTC catalog")
+        nb.add(FaultCodeTab(nb), text="Fault codes")
         nb.add(EcuTab(nb), text="ECU (read/write)")
 
 

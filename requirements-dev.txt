@@ -1,3 +1,7 @@
 # Runtime needs no third-party packages (Tkinter ships with Python).
 # Dev/test tooling only:
 pytest>=7.0
+
+# Optional: only needed to import the Cummins service fault-code .xls
+# (faultcodes.import_xls). Everything else is standard-library only.
+xlrd>=2.0.1

@@ -15,6 +15,10 @@ Calterm/INSITE calibration files.
   is a read-only reference of everything; the editable XDF pack excludes
   emissions monitors by default. It does **not** disable/mask emissions DTCs,
   monitors, or derates.
+- **Fault codes** – import the published Cummins service fault-code sheet
+  (CES 14602 `.xls`) into a searchable table (Cummins FC ↔ SPN / FMI / P-code /
+  lamp / description) and export it as CSV. `.xls` import needs the optional
+  `xlrd` package; searching/exporting a saved CSV is standard-library only.
 - **ECU (read/write)** – placeholder tab; the interface is stubbed so live ECU
   read/write can be added later without changing the rest of the app.
 
