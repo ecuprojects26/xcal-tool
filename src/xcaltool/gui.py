@@ -14,6 +14,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import struct
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -659,6 +660,12 @@ class EcuTab(ttk.Frame):
             messagebox.showinfo("xcaltool", "Simulation currently models a "
                                 "J1939 ECM. Switch protocol to j1939.")
             return None
+        if adapter.kind == "rp1210" and struct.calcsize("P") == 8:
+            messagebox.showwarning(
+                "32-bit driver",
+                "RP1210 driver DLLs (e.g. Nexiq NULN2R32.dll) are 32-bit and "
+                "will not load into 64-bit Python. Run this app with 32-bit "
+                "Python on Windows to use the USB-Link 2.")
         adapter.protocol = proto
         t = adapter.make()
         t.protocol = proto

@@ -82,8 +82,10 @@ class DiagnosticLink:
     # -- J1939 helpers ------------------------------------------------------
     def _send_pgn(self, pgn: int, body: bytes,
                   dest: int = j1939.GLOBAL_ADDRESS, priority: int = 6) -> None:
-        """Send a J1939 message, using BAM transport protocol if > 8 bytes."""
-        if len(body) <= 8:
+        """Send a J1939 message. Raw-CAN transports get BAM fragmentation for
+        payloads > 8 bytes; transports that reassemble TP themselves (RP1210)
+        get the whole message in one send."""
+        if len(body) <= 8 or self.transport.reassembles_tp:
             self.transport.send(body, j1939.pgn_to_canid(pgn, self.source, priority, dest))
         else:
             for cid, frame in j1939.build_tp_bam(pgn, body, self.source, priority):

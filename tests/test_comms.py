@@ -3,7 +3,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from xcaltool import comms, j1587, j1939, modules  # noqa: E402
+from xcaltool import comms, j1587, j1939, modules, transport  # noqa: E402
 from xcaltool.faultcodes import FaultCode  # noqa: E402
 
 
@@ -115,6 +115,20 @@ def test_flash_locked_without_security():
         pass
     finally:
         flasher.disconnect()
+
+
+def test_rp1210_canid_roundtrip():
+    Rp = transport.Rp1210Transport
+    # PDU1 destination-specific (request PGN 59904 to engine)
+    cid = j1939.pgn_to_canid(j1939.PGN_REQUEST, source=0xF9, dest=0x00)
+    priority, pgn, sa, da = Rp._split_canid(cid)
+    assert pgn == j1939.PGN_REQUEST and sa == 0xF9 and da == 0x00
+    assert Rp._make_canid(pgn, sa, priority, da) == cid
+    # PDU2 broadcast (DM1)
+    cid2 = j1939.pgn_to_canid(j1939.PGN_DM1, source=0x00)
+    _p, pgn2, sa2, da2 = Rp._split_canid(cid2)
+    assert pgn2 == j1939.PGN_DM1 and sa2 == 0x00 and da2 == 0xFF
+    assert transport.Rp1210Transport.reassembles_tp is True
 
 
 def test_annotate_descriptions():

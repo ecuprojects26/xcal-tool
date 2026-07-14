@@ -22,6 +22,7 @@ from __future__ import annotations
 import abc
 import os
 import queue
+import time
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -36,6 +37,10 @@ class Transport(abc.ABC):
     """Minimal send/receive interface."""
 
     protocol = "j1939"   # or "j1587"
+    # True when the driver reassembles J1939 Transport Protocol (BAM/RTS-CTS)
+    # itself and delivers complete multi-packet messages (e.g. RP1210). Raw-CAN
+    # transports leave this False so the diagnostic layer does TP itself.
+    reassembles_tp = False
 
     @abc.abstractmethod
     def open(self) -> None:
@@ -99,10 +104,21 @@ class SimulationTransport(Transport):
 # ---------------------------------------------------------------------------
 
 class Rp1210Transport(Transport):
-    """RP1210 vendor-DLL transport. Requires a compliant driver installed on
-    Windows (e.g. Nexiq USB-Link, Noregon DLA, Dearborn DPA). Not exercised in
-    this environment; kept structurally complete so it can be tested on the
-    truck."""
+    """RP1210 vendor-DLL transport for heavy-duty adapters (Nexiq USB-Link 2,
+    Noregon DLA, Dearborn DPA, ...). The driver reassembles J1939 Transport
+    Protocol itself, so complete messages are delivered/accepted here.
+
+    NOTE: RP1210 vendor DLLs are almost always **32-bit** (e.g. the Nexiq
+    ``NULN2R32.dll``), so this must run under **32-bit Python** on Windows.
+    Implemented to the RP1210C spec; verify framing against your adapter.
+    """
+
+    reassembles_tp = True
+
+    # RP1210 SendCommand numbers
+    _CMD_RESET = 0
+    _CMD_SET_ALL_FILTERS_TO_PASS = 3
+    _CMD_PROTECT_J1939_ADDRESS = 19
 
     def __init__(self, dll_name: str, device_id: int = 1,
                  protocol: str = "j1939", address: int = 0xF9):
@@ -112,31 +128,98 @@ class Rp1210Transport(Transport):
         self.address = address
         self._api = None
         self._client = None
+        self._ctypes = None
+
+    def _bind(self, api, ctypes):
+        api.RP1210_ClientConnect.restype = ctypes.c_short
+        api.RP1210_ClientDisconnect.restype = ctypes.c_short
+        api.RP1210_SendMessage.restype = ctypes.c_short
+        api.RP1210_ReadMessage.restype = ctypes.c_short
+        api.RP1210_SendCommand.restype = ctypes.c_short
 
     def open(self) -> None:
         import ctypes                                   # noqa: PLC0415 (optional)
-        self._api = ctypes.windll.LoadLibrary(self.dll_name)
+        self._ctypes = ctypes
+        try:
+            self._api = ctypes.windll.LoadLibrary(self.dll_name)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Could not load RP1210 DLL {self.dll_name!r} ({exc}). "
+                "RP1210 driver DLLs are 32-bit -- run this under 32-bit "
+                "Python on Windows with the adapter's drivers installed.")
+        self._bind(self._api, ctypes)
         proto = (b"J1939:Baud=250" if self.protocol == "j1939"
                  else b"J1708:Baud=9600")
+        # ClientConnect(hwndClient, nDeviceID, fpchProtocol, nTx, nRx, nIsAppPacketizing)
         client = self._api.RP1210_ClientConnect(
             0, self.device_id, proto, 0, 0, 0)
-        if client > 127:
+        if client > 127:                               # 128..255 are error codes
             raise RuntimeError(f"RP1210_ClientConnect failed ({client})")
         self._client = client
+        # Pass all traffic, then claim our source address on J1939.
+        self._api.RP1210_SendCommand(self._CMD_SET_ALL_FILTERS_TO_PASS,
+                                     client, None, 0)
+        if self.protocol == "j1939":
+            name = bytes([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+            cmd = bytes([self.address]) + name + bytes([0x00])   # +block flag
+            buf = ctypes.create_string_buffer(cmd, len(cmd))
+            self._api.RP1210_SendCommand(self._CMD_PROTECT_J1939_ADDRESS,
+                                         client, buf, len(cmd))
 
     def close(self) -> None:
         if self._api is not None and self._client is not None:
             self._api.RP1210_ClientDisconnect(self._client)
             self._client = None
 
+    @staticmethod
+    def _split_canid(can_id: int):
+        priority = (can_id >> 26) & 0x07
+        pf = (can_id >> 16) & 0xFF
+        ps = (can_id >> 8) & 0xFF
+        sa = can_id & 0xFF
+        if pf < 240:                                   # PDU1 destination-specific
+            return priority, (pf << 8), sa, ps
+        return priority, ((pf << 8) | ps), sa, 0xFF    # PDU2 broadcast
+
+    @staticmethod
+    def _make_canid(pgn: int, sa: int, priority: int, da: int) -> int:
+        pf = (pgn >> 8) & 0xFF
+        ps = pgn & 0xFF
+        if pf < 240:
+            cid = (priority << 26) | (pf << 16) | (da << 8) | sa
+        else:
+            cid = (priority << 26) | (pf << 16) | (ps << 8) | sa
+        return cid & 0x1FFFFFFF
+
     def send(self, data: bytes, can_id: int = 0) -> None:
-        raise NotImplementedError(
-            "RP1210 send is device-specific; wire this up on the truck with "
-            "your adapter's RP1210 driver.")
+        if self._api is None or self._client is None:
+            raise RuntimeError("transport not open")
+        priority, pgn, sa, da = self._split_canid(can_id)
+        if not sa:
+            sa = self.address
+        # RP1210 J1939 tx block: PGN(3, LE), priority, source, dest, data...
+        msg = bytes([pgn & 0xFF, (pgn >> 8) & 0xFF, (pgn >> 16) & 0xFF,
+                     priority & 0x07, sa, da]) + data
+        buf = self._ctypes.create_string_buffer(msg, len(msg))
+        rc = self._api.RP1210_SendMessage(self._client, buf, len(msg), 0, 0)
+        if rc != 0:
+            raise RuntimeError(f"RP1210_SendMessage failed ({rc})")
 
     def recv(self, timeout: float = 1.0) -> Optional[CanFrame]:
-        raise NotImplementedError(
-            "RP1210 recv is device-specific; wire this up on the truck.")
+        if self._api is None or self._client is None:
+            raise RuntimeError("transport not open")
+        buf = self._ctypes.create_string_buffer(2048)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            n = self._api.RP1210_ReadMessage(self._client, buf, 2048, 0)
+            if n > 10:
+                raw = buf.raw[:n]
+                # rx block: timestamp(4), PGN(3, LE), priority, SA, DA, data...
+                pgn = raw[4] | (raw[5] << 8) | (raw[6] << 16)
+                priority, sa, da = raw[7] & 0x07, raw[8], raw[9]
+                return CanFrame(self._make_canid(pgn, sa, priority, da), raw[10:])
+            time.sleep(0.002)
+        return None
 
 
 # ---------------------------------------------------------------------------
