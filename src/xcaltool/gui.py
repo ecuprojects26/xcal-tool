@@ -63,6 +63,19 @@ class XcalBinTab(ttk.Frame):
             foreground="#555", wraplength=720, justify="left",
         ).pack(anchor="w")
 
+        # Optional matching .ecfg for this calibration.
+        self._ecfg_defn = None
+        ecfg_row = ttk.LabelFrame(self, text="Matching .ecfg (optional)", padding=6)
+        ecfg_row.pack(fill="x", pady=(8, 0))
+        ttk.Button(ecfg_row, text="Open .ecfg...",
+                   command=self.open_ecfg).pack(side="left")
+        ttk.Button(ecfg_row, text="Export XDF...",
+                   command=lambda: self.export_ecfg("xdf")).pack(side="left", padx=6)
+        ttk.Button(ecfg_row, text="Export CSV...",
+                   command=lambda: self.export_ecfg("csv")).pack(side="left")
+        self.ecfg_lbl = ttk.Label(ecfg_row, text="no .ecfg loaded")
+        self.ecfg_lbl.pack(side="left", padx=10)
+
         self.report = tk.Text(self, height=8, wrap="none")
         self.report.pack(fill="x", pady=8)
         self.hex = tk.Text(self, height=14, wrap="none", font=("Courier", 9))
@@ -181,6 +194,40 @@ class XcalBinTab(ttk.Frame):
         with open(out, "wb") as fh:
             fh.write(blob)
         messagebox.showinfo("Done", f"Wrote {len(blob):,} bytes to\n{out}")
+
+    def open_ecfg(self):
+        path = filedialog.askopenfilename(
+            title="Open matching .ecfg",
+            filetypes=[("ECFG", "*.ecfg"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        with open(path, "rb") as fh:
+            data = fh.read()
+        try:
+            self._ecfg_defn = ecfg.parse(data)
+        except ecfg.EcfgError as exc:
+            messagebox.showerror("Parse failed", str(exc))
+            return
+        d = self._ecfg_defn
+        self.ecfg_lbl.config(
+            text=f"{os.path.basename(path)}  ({d.ecm} {d.version}, "
+                 f"{len(d.parameters):,} params)"
+        )
+
+    def export_ecfg(self, kind: str):
+        if self._ecfg_defn is None:
+            messagebox.showinfo("xcaltool", "Open an .ecfg first.")
+            return
+        text = (ecfg.to_xdf(self._ecfg_defn) if kind == "xdf"
+                else ecfg.to_csv(self._ecfg_defn))
+        ext = ".xdf" if kind == "xdf" else ".csv"
+        out = filedialog.asksaveasfilename(defaultextension=ext)
+        if not out:
+            return
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        messagebox.showinfo("Done", f"Wrote {out}")
 
     def bin_to_xcal_template(self):
         if not self._data:
