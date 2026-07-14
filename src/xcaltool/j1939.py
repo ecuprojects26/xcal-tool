@@ -28,6 +28,7 @@ PGN_COMPONENT_ID = 65259    # 0xFEEB  Make*Model*Serial*Unit
 PGN_SOFTWARE_ID = 65242     # 0xFEDA
 PGN_VEHICLE_ID = 65260      # 0xFEEC  VIN
 PGN_ECU_ID = 64965          # 0xFDC5  ECU part#*serial*location*type*mfr
+PGN_ENGINE_CONFIG = 65251   # 0xFEE3  Engine Configuration (rated torque/speed)
 PGN_TP_CM = 60416           # 0xEC00  transport-protocol connection management
 PGN_TP_DT = 60160           # 0xEB00  transport-protocol data transfer
 TP_BAM = 0x20               # broadcast-announce control byte
@@ -239,3 +240,19 @@ def decode_software_id(data: bytes) -> List[str]:
     body = data[1:] if data else b""
     return [f.decode("latin-1", "replace").strip("\x00 ")
             for f in body.split(b"*") if f]
+
+
+def decode_engine_config(data: bytes) -> dict:
+    """Decode Engine Configuration (PGN 65251). Returns reference engine
+    torque (SPN 544, 1 N*m/bit at bytes 30-31) and rated speed (SPN 189,
+    0.125 rpm/bit at bytes 32-33) when the message is long enough."""
+    out: dict = {}
+    if len(data) >= 31:
+        raw = data[29] | (data[30] << 8)
+        if raw not in (0xFFFF, 0xFE00):
+            out["reference_torque_nm"] = raw            # 1 N*m/bit
+    if len(data) >= 33:
+        raw = data[31] | (data[32] << 8)
+        if raw not in (0xFFFF, 0xFE00):
+            out["rated_speed_rpm"] = raw * 0.125
+    return out

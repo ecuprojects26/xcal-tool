@@ -30,6 +30,9 @@ class EcuInfo:
     vin: str = ""
     make: str = ""
     model: str = ""
+    cpl: str = ""                # Cummins Critical Parts List
+    rated_hp: str = ""           # rated engine power
+    rated_torque: str = ""       # rated engine torque
     software: List[str] = field(default_factory=list)
 
 
@@ -128,6 +131,8 @@ class DiagnosticLink:
                 c = j1939.decode_component_id(comp)
                 info.make, info.model = c["make"], c["model"]
                 info.serial = c["serial"]
+                if c["unit"].upper().startswith("CPL"):
+                    info.cpl = c["unit"]
             vin = self._request_pgn(j1939.PGN_VEHICLE_ID)
             if vin:
                 info.vin = j1939.decode_vin(vin)
@@ -137,12 +142,25 @@ class DiagnosticLink:
                 info.part_number = e["part_number"]
                 if e["serial"] and not info.serial:
                     info.serial = e["serial"]
+                if e["type"]:
+                    info.ecm_code = e["type"]
             soft = self._request_pgn(j1939.PGN_SOFTWARE_ID)
             if soft:
                 info.software = j1939.decode_software_id(soft)
                 if info.software:
                     info.calibration_id = info.software[0]
-            info.ecm_code = info.model or "Cummins ECM"
+            cfg = self._request_pgn(j1939.PGN_ENGINE_CONFIG)
+            if cfg:
+                ec = j1939.decode_engine_config(cfg)
+                torque = ec.get("reference_torque_nm")
+                speed = ec.get("rated_speed_rpm")
+                if torque:
+                    info.rated_torque = f"{round(torque * 0.737562)} lb-ft"
+                    if speed:
+                        kw = torque * speed / 9549.0
+                        info.rated_hp = f"{round(kw * 1.34102)} hp"
+            if not info.ecm_code:
+                info.ecm_code = info.model or "Cummins ECM"
         else:
             comp = self._j1587_request(j1587.PID_COMPONENT_ID)
             if comp:
@@ -250,10 +268,18 @@ class SimulatedEcu:
     demo seed/key gate, so read/write/verify can be tested with no hardware."""
 
     def __init__(self, image_size: int = 0x4000, seed: int = 0x1234):
-        self.component_id = b"Cummins*CM2450*79512345*UNIT01"
+        self.component_id = b"Cummins*CM2450*79512345*CPL4310"
         self.software_id = b"\x01CHR-CC-DP-MY19-V51.19.09.02*"
         self.vin = b"3C63R3EL8KG512345*"
-        self.ecu_id = b"4353993*79512345*Engine*ECM*Cummins*"
+        self.ecu_id = b"4353993*79512345*Engine*BHQ*Cummins*"
+        # Engine Configuration (PGN 65251): reference torque 2508 N*m
+        # (~1850 lb-ft) @ 1800 rpm rated -> ~633 hp.
+        cfg = bytearray(b"\xFF" * 39)
+        cfg[29] = 2508 & 0xFF
+        cfg[30] = (2508 >> 8) & 0xFF
+        cfg[31] = int(1800 / 0.125) & 0xFF
+        cfg[32] = (int(1800 / 0.125) >> 8) & 0xFF
+        self.engine_config = bytes(cfg)
         self.active = [
             j1939.J1939Dtc(spn=3251, fmi=2, occurrence_count=5),   # DPF pressure
             j1939.J1939Dtc(spn=1569, fmi=31, occurrence_count=1),  # fuel derate
@@ -309,6 +335,7 @@ class SimulatedEcu:
             j1939.PGN_VEHICLE_ID: self.vin,
             j1939.PGN_ECU_ID: self.ecu_id,
             j1939.PGN_SOFTWARE_ID: self.software_id,
+            j1939.PGN_ENGINE_CONFIG: self.engine_config,
             j1939.PGN_DM1: j1939.encode_dm(self.active),
             j1939.PGN_DM2: j1939.encode_dm(self.previously_active),
         }

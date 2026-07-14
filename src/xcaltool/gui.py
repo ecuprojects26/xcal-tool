@@ -11,6 +11,7 @@ The GUI only handles user interaction; all real work lives in the codec / ecfg
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import json
 import os
@@ -615,19 +616,48 @@ class EcuTab(ttk.Frame):
         self.prog = ttk.Progressbar(fbtns, length=220, mode="determinate")
         self.prog.pack(side="left", padx=10)
 
+        self._id_fields = [
+            ("VIN", "vin"), ("ESN", "serial"), ("SW VERSION", "calibration_id"),
+            ("ECU PN", "part_number"), ("ENGINE CPL", "cpl"),
+            ("ENGINE HP", "rated_hp"), ("ENGINE TQ", "rated_torque"),
+            ("ECU CODE", "ecm_code"),
+        ]
+        self._id_vars = {}
+        tag = ttk.LabelFrame(self, text="ECU data tag", padding=8)
+        tag.pack(fill="x", pady=(4, 0))
+        for i, (label, key) in enumerate(self._id_fields):
+            r, c = divmod(i, 2)
+            ttk.Label(tag, text=label + ":", width=12,
+                      anchor="e").grid(row=r, column=c * 2, sticky="e", padx=(4, 6), pady=2)
+            var = tk.StringVar(value="—")
+            self._id_vars[key] = var
+            ttk.Label(tag, textvariable=var, width=30, anchor="w",
+                      font=("Courier", 9)).grid(row=r, column=c * 2 + 1, sticky="w")
+
         ttk.Label(
             self,
-            text="Simulation runs with no hardware (J1939). RP1210/J2534/"
-                 "SocketCAN need a real adapter. Read/clear codes is safe "
-                 "diagnostics. Flash read/write use J1939 DM14/15/16 and need an "
-                 "authorized seed/key module for real ECUs; 'Demo' unlocks only "
-                 "the simulator. Writes always back up and verify first.",
+            text="Connect auto-identifies and fills the data tag above. "
+                 "Simulation runs with no hardware (J1939). RP1210/J2534/"
+                 "SocketCAN need a real adapter. Flash read/write use J1939 "
+                 "DM14/15/16 and need an authorized seed/key module for real "
+                 "ECUs; 'Demo' unlocks only the simulator. Writes back up + "
+                 "verify first. (CPL/ECU CODE come from the ECM's ID fields and "
+                 "may be blank on some modules.)",
             foreground="#555", wraplength=720, justify="left",
-        ).pack(anchor="w")
+        ).pack(anchor="w", pady=(6, 0))
 
-        self.out = tk.Text(self, height=18, wrap="none", font=("Courier", 9))
+        self.out = tk.Text(self, height=12, wrap="none", font=("Courier", 9))
         self.out.pack(fill="both", expand=True, pady=8)
         self.rescan()
+
+    def _set_datatag(self, info):
+        values = dataclasses.asdict(info)
+        for key, var in self._id_vars.items():
+            var.set(values.get(key) or "—")
+
+    def _clear_datatag(self):
+        for var in self._id_vars.values():
+            var.set("—")
 
     def _log(self, text):
         self.out.insert("end", text + "\n")
@@ -683,12 +713,14 @@ class EcuTab(ttk.Frame):
             return
         self.conn_lbl.config(text=f"connected ({self.backend.get()})", foreground="#080")
         self._log(f"Connected via {self.backend.get()} [{self.proto.get()}].")
+        self.identify()                                # auto-ID + fill data tag
 
     def disconnect(self):
         if self.link:
             self.link.disconnect()
             self.link = None
         self.conn_lbl.config(text="disconnected", foreground="#a00")
+        self._clear_datatag()
 
     def _need_link(self):
         if self.link is None:
@@ -704,15 +736,14 @@ class EcuTab(ttk.Frame):
         except Exception as exc:
             messagebox.showerror("Identify failed", str(exc))
             return
+        self._set_datatag(info)
         self._log("-- ECU identity --")
-        self._log(f"  VIN            : {info.vin}")
-        self._log(f"  ESN (serial)   : {info.serial}")
-        self._log(f"  ECFG/cal version: {info.calibration_id}")
-        self._log(f"  make/model     : {info.make} {info.model}".rstrip())
-        if info.part_number:
-            self._log(f"  ECU part no.   : {info.part_number}")
+        for label, key in self._id_fields:
+            self._log(f"  {label:<11}: {self._id_vars[key].get()}")
+        if info.make or info.model:
+            self._log(f"  MAKE/MODEL : {info.make} {info.model}".rstrip())
         if info.software:
-            self._log(f"  software       : {', '.join(info.software)}")
+            self._log(f"  SOFTWARE   : {', '.join(info.software)}")
 
     def read_codes(self):
         if not self._need_link():
