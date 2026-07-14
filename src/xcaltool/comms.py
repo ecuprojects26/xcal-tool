@@ -22,6 +22,12 @@ from . import j1587, j1939, modules
 from .transport import CanFrame, SimulationTransport, Transport
 
 
+def _is_cal_code(s: str) -> bool:
+    """A Cummins calibration/ECU code is two letters + five digits, e.g.
+    ``EF10001``, ``IA80003``, ``ER80224``."""
+    return len(s) == 7 and s[:2].isalpha() and s[2:].isdigit()
+
+
 @dataclass
 class EcuInfo:
     ecm_code: str = ""
@@ -141,19 +147,29 @@ class DiagnosticLink:
             vin = self._request_pgn(j1939.PGN_VEHICLE_ID)
             if vin:
                 info.vin = j1939.decode_vin(vin)
+            ecu_type = ""
             ecu = self._request_pgn(j1939.PGN_ECU_ID)
             if ecu:
                 e = j1939.decode_ecu_id(ecu)
                 info.part_number = e["part_number"]
                 if e["serial"] and not info.serial:
                     info.serial = e["serial"]
-                if e["type"]:
-                    info.ecm_code = e["type"]
+                ecu_type = e["type"]
             soft = self._request_pgn(j1939.PGN_SOFTWARE_ID)
             if soft:
                 info.software = j1939.decode_software_id(soft)
-                if info.software:
+                # The Cummins calibration code (e.g. EF10001) is the ECU CODE;
+                # the longer descriptive string is the SW VERSION.
+                cal_codes = [s for s in info.software if _is_cal_code(s)]
+                versions = [s for s in info.software if not _is_cal_code(s)]
+                if cal_codes:
+                    info.ecm_code = cal_codes[0]
+                if versions:
+                    info.calibration_id = versions[0]
+                elif info.software:
                     info.calibration_id = info.software[0]
+            if not info.ecm_code and ecu_type:
+                info.ecm_code = ecu_type
             cfg = self._request_pgn(j1939.PGN_ENGINE_CONFIG)
             if cfg:
                 ec = j1939.decode_engine_config(cfg)
@@ -274,7 +290,7 @@ class SimulatedEcu:
 
     def __init__(self, image_size: int = 0x4000, seed: int = 0x1234):
         self.component_id = b"Cummins*CM2450*79512345*CPL4310"
-        self.software_id = b"\x01CHR-CC-DP-MY19-V51.19.09.02*"
+        self.software_id = b"\x02EF10001*CHR-CC-DP-MY19-V51.19.09.02*"
         self.vin = b"3C63R3EL8KG512345*"
         self.ecu_id = b"4353993*79512345*Engine*BHQ*Cummins*"
         # Engine Configuration (PGN 65251): reference torque 2508 N*m

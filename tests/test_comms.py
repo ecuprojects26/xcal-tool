@@ -56,7 +56,7 @@ def test_simulation_identify_read_clear():
         assert info.serial == "79512345"
         assert "51.19.09.02" in info.calibration_id
         assert info.cpl == "CPL4310"
-        assert info.ecm_code == "BHQ"
+        assert info.ecm_code == "EF10001"
         assert info.rated_torque == "1850 lb-ft"
         assert info.rated_hp.endswith("hp")
         active = link.read_dtcs(active=True)

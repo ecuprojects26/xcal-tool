@@ -616,11 +616,13 @@ class EcuTab(ttk.Frame):
         self.prog = ttk.Progressbar(fbtns, length=220, mode="determinate")
         self.prog.pack(side="left", padx=10)
 
+        # Two-column grid (row, col = divmod(index, 2)); ECU CODE at index 3
+        # sits directly under ESN (index 1).
         self._id_fields = [
-            ("VIN", "vin"), ("ESN", "serial"), ("SW VERSION", "calibration_id"),
+            ("VIN", "vin"), ("ESN", "serial"),
+            ("SW VERSION", "calibration_id"), ("ECU CODE", "ecm_code"),
             ("ECU PN", "part_number"), ("ENGINE CPL", "cpl"),
             ("ENGINE HP", "rated_hp"), ("ENGINE TQ", "rated_torque"),
-            ("ECU CODE", "ecm_code"),
         ]
         self._id_vars = {}
         tag = ttk.LabelFrame(self, text="ECU data tag", padding=8)
