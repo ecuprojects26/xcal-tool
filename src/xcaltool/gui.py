@@ -52,12 +52,15 @@ class XcalBinTab(ttk.Frame):
         actions.pack(fill="x", pady=8)
         ttk.Button(actions, text="xcal -> bin", command=self.xcal_to_bin).pack(side="left")
         ttk.Button(actions, text="bin -> xcal", command=self.bin_to_xcal).pack(side="left", padx=6)
+        ttk.Button(actions, text="bin -> xcal (use .xcal template)",
+                   command=self.bin_to_xcal_template).pack(side="left")
 
         ttk.Label(
             self,
-            text="bin -> xcal needs the .xcalmeta sidecar saved next to the .bin "
-                 "when it was extracted.",
-            foreground="#555",
+            text="bin -> xcal needs the .xcalmeta sidecar saved when you extracted "
+                 "the bin. No sidecar? Use 'template' and pick the matching "
+                 "original .xcal to wrap the bin.",
+            foreground="#555", wraplength=720, justify="left",
         ).pack(anchor="w")
 
         self.report = tk.Text(self, height=8, wrap="none")
@@ -178,6 +181,45 @@ class XcalBinTab(ttk.Frame):
         with open(out, "wb") as fh:
             fh.write(blob)
         messagebox.showinfo("Done", f"Wrote {len(blob):,} bytes to\n{out}")
+
+    def bin_to_xcal_template(self):
+        if not self._data:
+            messagebox.showinfo("xcaltool", "Open the .bin first (Open button).")
+            return
+        if xcalfmt.is_xcal(self._data):
+            messagebox.showinfo(
+                "xcaltool",
+                "The open file is already an .xcal. Open the .bin you want to "
+                "wrap, then use this button and pick the template .xcal.",
+            )
+            return
+        tpl_path = filedialog.askopenfilename(
+            title="Pick the matching original .xcal (template)",
+            filetypes=[("xcal file", "*.xcal"), ("All files", "*.*")],
+        )
+        if not tpl_path:
+            return
+        try:
+            with open(tpl_path, "rb") as fh:
+                template = fh.read()
+            blob = xcalfmt.build_from_template(self._data, template)
+        except (xcalfmt.XcalError, ValueError) as exc:
+            messagebox.showerror("Conversion failed", str(exc))
+            return
+        out = filedialog.asksaveasfilename(
+            defaultextension=".xcal", filetypes=[("xcal file", "*.xcal")]
+        )
+        if not out:
+            return
+        with open(out, "wb") as fh:
+            fh.write(blob)
+        messagebox.showinfo(
+            "Done",
+            f"Wrote {len(blob):,} bytes to\n{out}\n\n"
+            "Note: the template's 4-char token was reused as-is (it can't be "
+            "recomputed), so if you changed bytes EFILive may need to re-accept "
+            "the file.",
+        )
 
 
 class EcfgTab(ttk.Frame):

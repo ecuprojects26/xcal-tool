@@ -49,6 +49,29 @@ def test_xcal_to_bin_and_back():
     assert xcalfmt.bin_to_xcal(raw, meta) == blob
 
 
+def test_build_from_template_wraps_bin():
+    image = bytearray([0xFF]) * 0x800
+    for i in range(0x10, 0x30):
+        image[i] = i
+    runs = [(0x10, 0x20)]
+    blob, _ = _make_xcal(bytes(image), runs, token="A518")
+
+    # A "bin" that has extra trailing bytes beyond the covered flash (like an
+    # EFILive _efi.bin) still rebuilds the exact original .xcal.
+    fat_bin = bytes(image) + b"\xDE\xAD\xBE\xEF" * 16
+    assert xcalfmt.build_from_template(fat_bin, blob) == blob
+
+
+def test_build_from_template_rejects_short_bin():
+    blob, _ = _make_xcal(b"\xFF" * 0x800, [(0x10, 0x20)])
+    try:
+        xcalfmt.build_from_template(b"\xFF" * 0x20, blob)
+    except xcalfmt.XcalError:
+        pass
+    else:
+        raise AssertionError("expected XcalError for too-small bin")
+
+
 def test_header_fields_parsed():
     blob, _ = _make_xcal(b"\xFF" * 0x40, [(0x0, 0x10)])
     x = xcalfmt.parse(blob)

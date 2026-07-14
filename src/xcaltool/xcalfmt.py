@@ -227,3 +227,24 @@ def xcal_to_bin(data: bytes) -> Tuple[bytes, dict]:
 def bin_to_xcal(image: bytes, meta: dict) -> bytes:
     """Rebuild an .xcal from a raw image and the meta saved at extract time."""
     return build(image, meta)
+
+
+def build_from_template(image: bytes, template_xcal: bytes) -> bytes:
+    """Wrap a raw ``image`` (.bin) into an .xcal using an existing .xcal as a
+    template for the header, token, and coverage layout.
+
+    Use this when you have a bin (e.g. EFILive's ``_efi.bin``) and the matching
+    original .xcal but no ``.xcalmeta`` sidecar. The template's 4-char token is
+    reused verbatim (it cannot be recomputed), so if you changed bytes the
+    result may still need EFILive to re-accept it.
+    """
+    tpl = parse(template_xcal)
+    covered_end = max((s + n for s, n in tpl.runs), default=0)
+    if len(image) < covered_end:
+        raise XcalError(
+            f"bin is too small for this template: it covers up to "
+            f"0x{covered_end:X} bytes but the bin is only 0x{len(image):X}."
+        )
+    meta = tpl.meta()
+    meta["image_size"] = len(image)
+    return build(image, meta)
