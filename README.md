@@ -9,6 +9,12 @@ Calterm/INSITE calibration files.
   images and back (lossless round-trip via a `.xcalmeta` sidecar).
 - **ecfg → xdf/csv** – turn a Cummins `.ecfg` definition into a TunerPro `.xdf`
   or a `.csv` table.
+- **DTC catalog** – from an `.ecfg`, list the fault-code / diagnostic parameters,
+  classified by subsystem and flagged emissions-vs-config, for diagnostics and
+  legitimate hardware swaps (auto→manual, fuel-tank removal, engine swaps). CSV
+  is a read-only reference of everything; the editable XDF pack excludes
+  emissions monitors by default. It does **not** disable/mask emissions DTCs,
+  monitors, or derates.
 - **ECU (read/write)** – placeholder tab; the interface is stubbed so live ECU
   read/write can be added later without changing the rest of the app.
 

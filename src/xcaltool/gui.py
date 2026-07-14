@@ -17,7 +17,7 @@ from tkinter import filedialog, messagebox, ttk
 
 import json
 
-from . import __version__, ecfg, xcalfmt
+from . import __version__, dtc, ecfg, xcalfmt
 from .comms import NotConnectedBackend
 
 
@@ -232,6 +232,81 @@ class EcfgTab(ttk.Frame):
         messagebox.showinfo("Done", f"Wrote {out}")
 
 
+class DtcTab(ttk.Frame):
+    """Build a DTC catalog from an .ecfg for diagnostics / hardware swaps."""
+
+    def __init__(self, master):
+        super().__init__(master, padding=10)
+        self._defn = None
+        self._entries = []
+
+        top = ttk.Frame(self)
+        top.pack(fill="x")
+        ttk.Button(top, text="Open .ecfg...", command=self.open_file).pack(side="left")
+        self.file_lbl = ttk.Label(top, text="No file loaded")
+        self.file_lbl.pack(side="left", padx=10)
+
+        self.incl_emis = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            self,
+            text="Include emissions-related DTCs in the editable XDF pack "
+                 "(off = swap/config codes only)",
+            variable=self.incl_emis,
+        ).pack(anchor="w", pady=(6, 0))
+
+        actions = ttk.Frame(self)
+        actions.pack(fill="x", pady=8)
+        ttk.Button(actions, text="Export catalog CSV...",
+                   command=self.export_csv).pack(side="left")
+        ttk.Button(actions, text="Export DTC map pack (XDF)...",
+                   command=self.export_xdf).pack(side="left", padx=6)
+
+        self.report = tk.Text(self, height=16, wrap="word")
+        self.report.pack(fill="both", expand=True, pady=8)
+
+    def open_file(self):
+        path = filedialog.askopenfilename(
+            title="Open .ecfg", filetypes=[("ECFG", "*.ecfg"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+        with open(path, "rb") as fh:
+            data = fh.read()
+        try:
+            self._defn = ecfg.parse(data)
+        except ecfg.EcfgError as exc:
+            messagebox.showerror("Parse failed", str(exc))
+            return
+        self._entries = dtc.build_catalog(self._defn)
+        self.file_lbl.config(text=os.path.basename(path))
+        self.report.delete("1.0", "end")
+        self.report.insert("1.0", dtc.summary(self._entries))
+
+    def export_csv(self):
+        if not self._entries:
+            messagebox.showinfo("xcaltool", "Open an .ecfg first.")
+            return
+        out = filedialog.asksaveasfilename(defaultextension=".csv")
+        if not out:
+            return
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write(dtc.to_csv(self._entries))
+        messagebox.showinfo("Done", f"Wrote {out}")
+
+    def export_xdf(self):
+        if not self._entries:
+            messagebox.showinfo("xcaltool", "Open an .ecfg first.")
+            return
+        out = filedialog.asksaveasfilename(defaultextension=".xdf")
+        if not out:
+            return
+        xdf = dtc.to_xdf(self._defn, self._entries,
+                         include_emissions=self.incl_emis.get())
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write(xdf)
+        messagebox.showinfo("Done", f"Wrote {out}")
+
+
 class EcuTab(ttk.Frame):
     """Placeholder tab for future ECU read/write."""
 
@@ -263,6 +338,7 @@ class App(tk.Tk):
         nb.pack(fill="both", expand=True)
         nb.add(XcalBinTab(nb), text="xcal <-> bin")
         nb.add(EcfgTab(nb), text="ecfg -> xdf/csv")
+        nb.add(DtcTab(nb), text="DTC catalog")
         nb.add(EcuTab(nb), text="ECU (read/write)")
 
 
