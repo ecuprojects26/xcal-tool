@@ -3,7 +3,6 @@ name: Build Windows EXE
 on:
   push:
     branches: [main]
-    tags: ['v*']
   workflow_dispatch:
 
 jobs:
@@ -32,9 +31,3 @@ jobs:
         with:
           name: xcaltool-windows-x86
           path: dist/xcaltool.exe
-
-      - name: Attach exe to release (tags only)
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/xcaltool.exe
