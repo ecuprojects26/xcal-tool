@@ -1,0 +1,3 @@
+# Runtime needs no third-party packages (Tkinter ships with Python).
+# Dev/test tooling only:
+pytest>=7.0
