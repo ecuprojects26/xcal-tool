@@ -15,7 +15,9 @@ import os
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from . import __version__, codec, ecfg
+import json
+
+from . import __version__, ecfg, xcalfmt
 from .comms import NotConnectedBackend
 
 
@@ -33,7 +35,7 @@ def _hex_preview(data: bytes, max_rows: int = 24) -> str:
 
 
 class XcalBinTab(ttk.Frame):
-    """Tab for xcal <-> bin conversion."""
+    """Tab for xcal <-> bin conversion (EFILive/Cummins format)."""
 
     def __init__(self, master):
         super().__init__(master, padding=10)
@@ -42,50 +44,28 @@ class XcalBinTab(ttk.Frame):
 
         top = ttk.Frame(self)
         top.pack(fill="x")
-        ttk.Button(top, text="Open file...", command=self.open_file).pack(side="left")
+        ttk.Button(top, text="Open .xcal or .bin...", command=self.open_file).pack(side="left")
         self.file_lbl = ttk.Label(top, text="No file loaded")
         self.file_lbl.pack(side="left", padx=10)
 
-        # Container layout controls
-        opts = ttk.LabelFrame(self, text="Container layout", padding=8)
-        opts.pack(fill="x", pady=8)
-        ttk.Label(opts, text="Header bytes:").grid(row=0, column=0, sticky="w")
-        self.header_var = tk.IntVar(value=0)
-        ttk.Spinbox(opts, from_=0, to=1_000_000, textvariable=self.header_var,
-                    width=10).grid(row=0, column=1, padx=6)
-        ttk.Label(opts, text="Trailer bytes:").grid(row=0, column=2, sticky="w")
-        self.trailer_var = tk.IntVar(value=0)
-        ttk.Spinbox(opts, from_=0, to=1_000_000, textvariable=self.trailer_var,
-                    width=10).grid(row=0, column=3, padx=6)
-        ttk.Label(opts, text="Checksum:").grid(row=0, column=4, sticky="w")
-        self.checksum_var = tk.StringVar(value="none")
-        ttk.Combobox(
-            opts, textvariable=self.checksum_var, width=12, state="readonly",
-            values=["none", "sum8", "sum16", "sum32", "crc16_ccitt", "crc32"],
-        ).grid(row=0, column=5, padx=6)
-
-        # Action buttons
         actions = ttk.Frame(self)
-        actions.pack(fill="x")
+        actions.pack(fill="x", pady=8)
         ttk.Button(actions, text="xcal -> bin", command=self.xcal_to_bin).pack(side="left")
         ttk.Button(actions, text="bin -> xcal", command=self.bin_to_xcal).pack(side="left", padx=6)
-        ttk.Button(actions, text="Auto-detect", command=self.auto_detect).pack(side="left")
 
-        # Report + hex preview
-        self.report = tk.Text(self, height=6, wrap="none")
+        ttk.Label(
+            self,
+            text="bin -> xcal needs the .xcalmeta sidecar saved next to the .bin "
+                 "when it was extracted.",
+            foreground="#555",
+        ).pack(anchor="w")
+
+        self.report = tk.Text(self, height=8, wrap="none")
         self.report.pack(fill="x", pady=8)
-        self.hex = tk.Text(self, height=16, wrap="none", font=("Courier", 9))
+        self.hex = tk.Text(self, height=14, wrap="none", font=("Courier", 9))
         self.hex.pack(fill="both", expand=True)
 
     # -- helpers -----------------------------------------------------------
-    def _spec(self):
-        cs = self.checksum_var.get()
-        return codec.ContainerSpec(
-            header_len=self.header_var.get(),
-            trailer_len=self.trailer_var.get(),
-            checksum=None if cs == "none" else cs,
-        )
-
     def _set_report(self, text: str):
         self.report.delete("1.0", "end")
         self.report.insert("1.0", text)
@@ -106,29 +86,52 @@ class XcalBinTab(ttk.Frame):
             self._data = fh.read()
         self._path = path
         self.file_lbl.config(text=os.path.basename(path))
-        self.auto_detect()
+        self._describe()
         self._set_hex(self._data)
 
-    def auto_detect(self):
+    def _describe(self):
         if not self._data:
             return
-        info = codec.analyze(self._data)
-        spec = codec.guess_spec(self._data)
-        self.header_var.set(spec.header_len)
-        self.trailer_var.set(spec.trailer_len)
-        self._set_report(
-            "\n".join(f"{k}: {v}" for k, v in info.items())
-            + f"\n\nGuessed header bytes: {spec.header_len} "
-            "(adjust above if wrong)"
-        )
+        if xcalfmt.is_xcal(self._data):
+            try:
+                x = xcalfmt.parse(self._data)
+            except xcalfmt.XcalError as exc:
+                self._set_report(f"Looks like an .xcal but failed to parse:\n{exc}")
+                return
+            f = x.fields
+            lines = [
+                "Detected: EFILive/Cummins .xcal",
+                f"  module      : {f.get('module_name', '?')}",
+                f"  calibration : {f.get('calibration_version', '?')}",
+                f"  product_id  : {f.get('product_id', '?')}",
+                f"  byte_order  : {f.get('byte_order', '?')}",
+                f"  token       : {x.token}",
+                f"  image size  : {len(x.image):,} bytes (0x{len(x.image):X})",
+                f"  hex runs    : {len(x.runs)}",
+                "",
+                "Click 'xcal -> bin' to extract the raw flash image.",
+            ]
+            self._set_report("\n".join(lines))
+        else:
+            sidecar = self._path + ".xcalmeta"
+            has = os.path.exists(sidecar)
+            self._set_report(
+                f"Detected: raw .bin ({len(self._data):,} bytes)\n"
+                f"Sidecar {'found' if has else 'NOT found'}: "
+                f"{os.path.basename(sidecar)}\n\n"
+                + ("Click 'bin -> xcal' to rebuild the .xcal."
+                   if has else
+                   "Extract this bin from its .xcal first so a .xcalmeta sidecar "
+                   "exists, then bin -> xcal can rebuild it.")
+            )
 
     def xcal_to_bin(self):
         if not self._data:
             messagebox.showinfo("xcaltool", "Open a file first.")
             return
         try:
-            result = codec.extract_bin(self._data, self._spec())
-        except codec.ConversionError as exc:
+            image, meta = xcalfmt.xcal_to_bin(self._data)
+        except xcalfmt.XcalError as exc:
             messagebox.showerror("Conversion failed", str(exc))
             return
         out = filedialog.asksaveasfilename(
@@ -137,29 +140,34 @@ class XcalBinTab(ttk.Frame):
         if not out:
             return
         with open(out, "wb") as fh:
-            fh.write(result.payload)
-        # Save a sidecar so bin -> xcal can rebuild the exact original.
-        codec.write_sidecar(out + ".xcalmeta", result)
+            fh.write(image)
+        with open(out + ".xcalmeta", "w", encoding="utf-8") as fh:
+            json.dump(meta, fh)
         messagebox.showinfo(
             "Done",
-            f"Wrote {len(result.payload)} bytes to\n{out}\n\n"
-            "A .xcalmeta sidecar was saved so you can rebuild the exact "
-            "original .xcal later.",
+            f"Wrote {len(image):,} bytes to\n{out}\n\n"
+            "Saved a .xcalmeta sidecar so 'bin -> xcal' can rebuild the exact "
+            "original .xcal.",
         )
-        self._set_hex(result.payload)
+        self._set_hex(image)
 
     def bin_to_xcal(self):
         if not self._data:
             messagebox.showinfo("xcaltool", "Open a file first.")
             return
         sidecar_path = self._path + ".xcalmeta"
+        if not os.path.exists(sidecar_path):
+            messagebox.showerror(
+                "Missing sidecar",
+                "No .xcalmeta found next to this .bin. Extract the bin from its "
+                ".xcal first (that saves the sidecar), then rebuild.",
+            )
+            return
         try:
-            if os.path.exists(sidecar_path):
-                sidecar = codec.read_sidecar(sidecar_path)
-                blob = codec.rebuild_from_sidecar(self._data, sidecar)
-            else:
-                blob = codec.build_xcal(self._data, spec=self._spec())
-        except codec.ConversionError as exc:
+            with open(sidecar_path, "r", encoding="utf-8") as fh:
+                meta = json.load(fh)
+            blob = xcalfmt.bin_to_xcal(self._data, meta)
+        except (xcalfmt.XcalError, ValueError, KeyError) as exc:
             messagebox.showerror("Conversion failed", str(exc))
             return
         out = filedialog.asksaveasfilename(
@@ -169,7 +177,7 @@ class XcalBinTab(ttk.Frame):
             return
         with open(out, "wb") as fh:
             fh.write(blob)
-        messagebox.showinfo("Done", f"Wrote {len(blob)} bytes to\n{out}")
+        messagebox.showinfo("Done", f"Wrote {len(blob):,} bytes to\n{out}")
 
 
 class EcfgTab(ttk.Frame):

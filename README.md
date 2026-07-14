@@ -12,17 +12,21 @@ Calterm/INSITE calibration files.
 - **ECU (read/write)** – placeholder tab; the interface is stubbed so live ECU
   read/write can be added later without changing the rest of the app.
 
-## Status / honesty note
+## Status
 
-The `.xcal` and `.ecfg` formats are **not publicly documented**. The app is
-built around configurable/neutral models so it's useful today, but the exact
-byte layouts still need to be confirmed against **real sample files**:
-
-- `xcal ↔ bin` works as a generic container tool now: it auto-detects a likely
-  header and lets you adjust header/trailer offsets and pick a checksum. Once a
-  real `.xcal` sample is available, the correct defaults get locked in.
-- `ecfg → xdf/csv`: the XDF and CSV **writers are complete and tested**; the
-  `.ecfg` **parser** is a stub that waits for a sample file.
+- **`xcal ↔ bin`** — fully implemented and validated **byte-exact** against real
+  EFILive/Cummins `.xcal` files (CM22xx / CM23xx / CM2450A). The `.xcal` is a
+  text `compatibility_header` followed by Intel-HEX records; we decode those to
+  the raw flash image and rebuild the exact `.xcal` from a small `.xcalmeta`
+  sidecar. See `xcalfmt.py` for the format writeup and the known limitation
+  around EFILive's undocumented file-integrity token.
+- **`ecfg → xdf/csv`** — fully implemented. Parses the Cummins
+  `Engineering_Tool_Config_File` XML (tens of thousands of parameters) into a
+  neutral model and exports CSV (every parameter definition) and a TunerPro XDF
+  skeleton. XDF element addresses are parameter **ids** (the `.ecfg` addresses by
+  id, not raw offset); resolving ids to `.bin` offsets via the module index
+  table is a planned follow-up.
+- **ECU (read/write)** — interface only (`comms.py`); no hardware backend yet.
 
 ## Requirements
 
@@ -49,9 +53,10 @@ python -m pytest -q
 ```
 run.py                 # launches the GUI
 src/xcaltool/
-  codec.py             # xcal <-> bin conversion
+  xcalfmt.py           # EFILive/Cummins xcal <-> bin conversion (real format)
+  codec.py             # generic container helpers + checksums glue
   checksum.py          # checksum algorithms
-  ecfg.py              # ecfg parsing (stub) + XDF/CSV writers
+  ecfg.py              # ecfg XML parser + XDF/CSV exporters
   comms.py             # abstract ECU read/write interface (future)
   gui.py               # Tkinter UI (3 tabs)
 tests/                 # unit tests
