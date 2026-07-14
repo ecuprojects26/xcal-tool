@@ -17,7 +17,7 @@ import abc
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
-from . import j1587, j1939
+from . import j1587, j1939, modules
 from .transport import CanFrame, SimulationTransport, Transport
 
 
@@ -80,19 +80,43 @@ class DiagnosticLink:
         self.disconnect()
 
     # -- J1939 helpers ------------------------------------------------------
-    def _request_pgn(self, pgn: int, timeout: float = 1.0) -> Optional[bytes]:
-        cid = j1939.pgn_to_canid(j1939.PGN_REQUEST, self.source,
-                                 dest=j1939.ENGINE_ADDRESS)
-        self.transport.send(j1939.request_pgn(pgn), cid)
-        deadline_frames = 0
-        while deadline_frames < 32:
+    def _send_pgn(self, pgn: int, body: bytes,
+                  dest: int = j1939.GLOBAL_ADDRESS, priority: int = 6) -> None:
+        """Send a J1939 message, using BAM transport protocol if > 8 bytes."""
+        if len(body) <= 8:
+            self.transport.send(body, j1939.pgn_to_canid(pgn, self.source, priority, dest))
+        else:
+            for cid, frame in j1939.build_tp_bam(pgn, body, self.source, priority):
+                self.transport.send(frame, cid)
+
+    def _collect(self, pgn: int, timeout: float = 1.0) -> Optional[bytes]:
+        """Read frames until ``pgn`` arrives, reassembling BAM multi-packet
+        responses when the data exceeds 8 bytes."""
+        bam_total = 0
+        bam_buf = bytearray()
+        for _ in range(4096):
             frame = self.transport.recv(timeout)
             if frame is None:
                 return None
-            if j1939.canid_to_pgn(frame.can_id) == pgn:
+            fpgn = j1939.canid_to_pgn(frame.can_id)
+            if fpgn == pgn:                                 # single-frame answer
                 return frame.data
-            deadline_frames += 1
+            if fpgn == j1939.PGN_TP_CM:
+                bam = j1939.parse_tp_cm_bam(frame.data)
+                if bam and bam[2] == pgn:                   # BAM announces our PGN
+                    bam_total = bam[0]
+                    bam_buf = bytearray()
+            elif fpgn == j1939.PGN_TP_DT and bam_total:
+                bam_buf += frame.data[1:8]
+                if len(bam_buf) >= bam_total:
+                    return bytes(bam_buf[:bam_total])
         return None
+
+    def _request_pgn(self, pgn: int, timeout: float = 1.0) -> Optional[bytes]:
+        """Request ``pgn`` and return its (possibly multi-packet) payload."""
+        self._send_pgn(j1939.PGN_REQUEST, j1939.request_pgn(pgn),
+                       dest=j1939.ENGINE_ADDRESS)
+        return self._collect(pgn, timeout)
 
     def identify(self) -> EcuInfo:
         info = EcuInfo()
@@ -192,14 +216,41 @@ def annotate_descriptions(dtcs: List[DtcResult], fault_records) -> None:
 # Simulation ECU (offline testing)
 # ---------------------------------------------------------------------------
 
-class SimulatedEcu:
-    """A fake Cummins ECM that answers J1939 request-PGNs."""
+# -- Seed/key security (pluggable; nothing proprietary shipped) -------------
 
-    def __init__(self):
+class SecurityProvider(abc.ABC):
+    """Turns an ECU seed into the unlock key. Real Cummins ECMs need the
+    operator's own licensed/authorized implementation -- none is shipped here."""
+
+    @abc.abstractmethod
+    def key_from_seed(self, seed: int, level: int = 1) -> int:
+        ...
+
+
+class DemoSecurityProvider(SecurityProvider):
+    """Matches the built-in :class:`SimulatedEcu` ONLY, so the read/write flow
+    can be exercised offline. This is a toy transform, NOT a Cummins algorithm,
+    and will not unlock any real ECU."""
+
+    def key_from_seed(self, seed: int, level: int = 1) -> int:
+        return (seed ^ 0xA5A5) & 0xFFFF
+
+
+class SecurityError(RuntimeError):
+    pass
+
+
+# -- Simulated ECU ----------------------------------------------------------
+
+class SimulatedEcu:
+    """A fake Cummins ECM: answers J1939 request-PGNs and implements a
+    DM14/DM15/DM16 memory-access state machine over a flash buffer, including a
+    demo seed/key gate, so read/write/verify can be tested with no hardware."""
+
+    def __init__(self, image_size: int = 0x4000, seed: int = 0x1234):
         self.component_id = b"Cummins*CM2450*79512345*UNIT01"
         self.software_id = b"\x01CHR-CC-DP-MY19-V51.19.09.02*"
         self.vin = b"3C63R3EL8KG512345*"
-        # ECU part#*serial*location*type*manufacturer
         self.ecu_id = b"4353993*79512345*Engine*ECM*Cummins*"
         self.active = [
             j1939.J1939Dtc(spn=3251, fmi=2, occurrence_count=5),   # DPF pressure
@@ -208,41 +259,267 @@ class SimulatedEcu:
         self.previously_active = [
             j1939.J1939Dtc(spn=629, fmi=12, occurrence_count=9),   # ECM
         ]
+        # Flash buffer, pre-filled with a recognisable pattern.
+        self.memory = bytearray((i & 0xFF) for i in range(image_size))
+        self.seed = seed
+        self.expected_key = (seed ^ 0xA5A5) & 0xFFFF
+        self.unlocked = False
+        self._pending_write = None          # (address, num_bytes)
+        self._rx_bam = None                 # (pgn, total, buf) incoming BAM
 
+    # -- incoming frame handling (with BAM reassembly) ---------------------
     def respond(self, frame: CanFrame) -> List[CanFrame]:
-        if j1939.canid_to_pgn(frame.can_id) != j1939.PGN_REQUEST or len(frame.data) < 3:
+        pgn = j1939.canid_to_pgn(frame.can_id)
+        if pgn == j1939.PGN_TP_CM:
+            bam = j1939.parse_tp_cm_bam(frame.data)
+            if bam:
+                self._rx_bam = (bam[2], bam[0], bytearray())
             return []
-        pgn = frame.data[0] | (frame.data[1] << 8) | (frame.data[2] << 16)
-        sa = j1939.ENGINE_ADDRESS
+        if pgn == j1939.PGN_TP_DT and self._rx_bam is not None:
+            tp_pgn, total, buf = self._rx_bam
+            buf += frame.data[1:8]
+            if len(buf) >= total:
+                self._rx_bam = None
+                return self._handle(tp_pgn, bytes(buf[:total]))
+            return []
+        return self._handle(pgn, frame.data)
 
-        def reply(p, body):
-            return CanFrame(j1939.pgn_to_canid(p, sa), body)
-
-        if pgn == j1939.PGN_COMPONENT_ID:
-            return [reply(pgn, self.component_id)]
-        if pgn == j1939.PGN_VEHICLE_ID:
-            return [reply(pgn, self.vin)]
-        if pgn == j1939.PGN_ECU_ID:
-            return [reply(pgn, self.ecu_id)]
-        if pgn == j1939.PGN_SOFTWARE_ID:
-            return [reply(pgn, self.software_id)]
-        if pgn == j1939.PGN_DM1:
-            return [reply(pgn, j1939.encode_dm(self.active))]
-        if pgn == j1939.PGN_DM2:
-            return [reply(pgn, j1939.encode_dm(self.previously_active))]
-        if pgn == j1939.PGN_DM11:
-            self.active = []
-            return []
-        if pgn == j1939.PGN_DM3:
-            self.previously_active = []
-            return []
+    # -- dispatch a complete message --------------------------------------
+    def _handle(self, pgn: int, data: bytes) -> List[CanFrame]:
+        if pgn == j1939.PGN_REQUEST and len(data) >= 3:
+            req = data[0] | (data[1] << 8) | (data[2] << 16)
+            return self._handle_request(req)
+        if pgn == j1939.PGN_DM14:
+            return self._handle_dm14(data)
+        if pgn == j1939.PGN_DM16:
+            return self._handle_dm16(data)
         return []
+
+    def _emit(self, pgn: int, body: bytes) -> List[CanFrame]:
+        sa = j1939.ENGINE_ADDRESS
+        if len(body) <= 8:
+            return [CanFrame(j1939.pgn_to_canid(pgn, sa), body)]
+        return [CanFrame(cid, fr) for cid, fr in j1939.build_tp_bam(pgn, body, sa)]
+
+    def _handle_request(self, req: int) -> List[CanFrame]:
+        table = {
+            j1939.PGN_COMPONENT_ID: self.component_id,
+            j1939.PGN_VEHICLE_ID: self.vin,
+            j1939.PGN_ECU_ID: self.ecu_id,
+            j1939.PGN_SOFTWARE_ID: self.software_id,
+            j1939.PGN_DM1: j1939.encode_dm(self.active),
+            j1939.PGN_DM2: j1939.encode_dm(self.previously_active),
+        }
+        if req in table:
+            return self._emit(req, table[req])
+        if req == j1939.PGN_DM11:
+            self.active = []
+        elif req == j1939.PGN_DM3:
+            self.previously_active = []
+        return []
+
+    def _handle_dm14(self, data: bytes) -> List[CanFrame]:
+        m = j1939.decode_dm14(data)
+        cmd = m["command"]
+        if cmd == j1939.CMD_STATUS_REQUEST:
+            if m["key"] == self.expected_key:
+                self.unlocked = True
+                return self._emit(j1939.PGN_DM15,
+                                  j1939.encode_dm15(0, j1939.STATUS_PROCEED, seed=0))
+            return self._emit(j1939.PGN_DM15,
+                              j1939.encode_dm15(0, j1939.STATUS_PROCEED, seed=self.seed))
+        if not self.unlocked:
+            return self._emit(j1939.PGN_DM15,
+                              j1939.encode_dm15(0, j1939.STATUS_OP_FAILED, error=1))
+        if cmd == j1939.CMD_READ:
+            addr, n = m["address"], m["num_bytes"]
+            chunk = bytes(self.memory[addr:addr + n])
+            return (self._emit(j1939.PGN_DM15, j1939.encode_dm15(n, j1939.STATUS_PROCEED))
+                    + self._emit(j1939.PGN_DM16, j1939.encode_dm16(chunk)))
+        if cmd == j1939.CMD_WRITE:
+            self._pending_write = (m["address"], m["num_bytes"])
+            return self._emit(j1939.PGN_DM15,
+                              j1939.encode_dm15(m["num_bytes"], j1939.STATUS_PROCEED))
+        if cmd == j1939.CMD_ERASE:
+            addr, n = m["address"], m["num_bytes"]
+            self.memory[addr:addr + n] = b"\xFF" * n
+            return self._emit(j1939.PGN_DM15,
+                              j1939.encode_dm15(0, j1939.STATUS_OP_COMPLETED))
+        return self._emit(j1939.PGN_DM15,
+                          j1939.encode_dm15(0, j1939.STATUS_OP_FAILED, error=2))
+
+    def _handle_dm16(self, data: bytes) -> List[CanFrame]:
+        if self._pending_write is None:
+            return []
+        addr, n = self._pending_write
+        self._pending_write = None
+        payload = j1939.decode_dm16(data)[:n]
+        self.memory[addr:addr + len(payload)] = payload
+        return self._emit(j1939.PGN_DM15,
+                          j1939.encode_dm15(0, j1939.STATUS_OP_COMPLETED))
+
+
+# -- Flash read/write over J1939 memory access ------------------------------
+
+Progress = Optional[Callable[[int, int], None]]
+
+
+class J1939Flasher:
+    """Reads/writes an ECU flash image over J1939 DM14/DM15/DM16.
+
+    Requires an unlocked session; unlocking needs a :class:`SecurityProvider`
+    for the target ECU. Reads assemble a raw ``.bin`` from the module profile's
+    regions; writes are backup-first (caller keeps the returned backup) and
+    verified by read-back.
+    """
+
+    def __init__(self, link: DiagnosticLink, profile: modules.ModuleProfile,
+                 security: Optional[SecurityProvider] = None,
+                 block_size: int = 256, timeout: float = 2.0):
+        self.link = link
+        self.profile = profile
+        self.security = security
+        self.block_size = block_size
+        self.timeout = timeout
+
+    def connect(self) -> None:
+        self.link.connect()
+
+    def disconnect(self) -> None:
+        self.link.disconnect()
+
+    def identify(self) -> EcuInfo:
+        return self.link.identify()
+
+    # -- security ----------------------------------------------------------
+    def unlock(self) -> None:
+        self.link._send_pgn(j1939.PGN_DM14,
+                            j1939.encode_dm14(0, j1939.CMD_STATUS_REQUEST, 0),
+                            dest=j1939.ENGINE_ADDRESS)
+        resp = self.link._collect(j1939.PGN_DM15, self.timeout)
+        if resp is None:
+            raise SecurityError("no DM15 response to status request")
+        st = j1939.decode_dm15(resp)
+        if st["seed"] == 0 and st["status"] == j1939.STATUS_PROCEED:
+            return                                          # already unlocked
+        if self.security is None:
+            raise SecurityError(
+                "ECU is locked (seed 0x%04X); an authorized SecurityProvider "
+                "is required to compute the key." % st["seed"])
+        key = self.security.key_from_seed(st["seed"])
+        self.link._send_pgn(j1939.PGN_DM14,
+                            j1939.encode_dm14(0, j1939.CMD_STATUS_REQUEST, 0, key=key),
+                            dest=j1939.ENGINE_ADDRESS)
+        resp = self.link._collect(j1939.PGN_DM15, self.timeout)
+        if resp is None or j1939.decode_dm15(resp)["status"] != j1939.STATUS_PROCEED:
+            raise SecurityError("unlock rejected (wrong key)")
+
+    # -- read --------------------------------------------------------------
+    def read_region(self, address: int, size: int, progress: Progress = None) -> bytes:
+        out = bytearray()
+        done = 0
+        while done < size:
+            n = min(self.block_size, size - done)
+            self.link._send_pgn(j1939.PGN_DM14,
+                                j1939.encode_dm14(n, j1939.CMD_READ, address + done),
+                                dest=j1939.ENGINE_ADDRESS)
+            r = self.link._collect(j1939.PGN_DM15, self.timeout)
+            if r is None or j1939.decode_dm15(r)["status"] != j1939.STATUS_PROCEED:
+                raise IOError("read denied at 0x%08X" % (address + done))
+            d = self.link._collect(j1939.PGN_DM16, self.timeout)
+            if d is None:
+                raise IOError("no data at 0x%08X" % (address + done))
+            out += j1939.decode_dm16(d)
+            done += n
+            if progress:
+                progress(done, size)
+        return bytes(out[:size])
+
+    def read_image(self, progress: Progress = None) -> bytes:
+        self.unlock()
+        image = bytearray(b"\xFF" * self.profile.image_size)
+        total = self.profile.total_bytes()
+        done = 0
+
+        def region_progress(cur, _size):
+            if progress:
+                progress(done + cur, total)
+
+        for region in self.profile.regions:
+            data = self.read_region(region.address, region.size, region_progress)
+            image[region.image_offset:region.image_offset + len(data)] = data
+            done += region.size
+        return bytes(image)
+
+    # -- write -------------------------------------------------------------
+    def write_region(self, address: int, data: bytes, progress: Progress = None) -> None:
+        # Erase, then write in blocks.
+        self.link._send_pgn(j1939.PGN_DM14,
+                            j1939.encode_dm14(len(data), j1939.CMD_ERASE, address),
+                            dest=j1939.ENGINE_ADDRESS)
+        r = self.link._collect(j1939.PGN_DM15, self.timeout)
+        if r is None or j1939.decode_dm15(r)["status"] not in (
+                j1939.STATUS_OP_COMPLETED, j1939.STATUS_PROCEED):
+            raise IOError("erase denied at 0x%08X" % address)
+        done = 0
+        while done < len(data):
+            n = min(self.block_size, len(data) - done)
+            chunk = data[done:done + n]
+            self.link._send_pgn(j1939.PGN_DM14,
+                                j1939.encode_dm14(n, j1939.CMD_WRITE, address + done),
+                                dest=j1939.ENGINE_ADDRESS)
+            r = self.link._collect(j1939.PGN_DM15, self.timeout)
+            if r is None or j1939.decode_dm15(r)["status"] != j1939.STATUS_PROCEED:
+                raise IOError("write denied at 0x%08X" % (address + done))
+            self.link._send_pgn(j1939.PGN_DM16, j1939.encode_dm16(chunk),
+                                dest=j1939.ENGINE_ADDRESS)
+            r = self.link._collect(j1939.PGN_DM15, self.timeout)
+            if r is None or j1939.decode_dm15(r)["status"] != j1939.STATUS_OP_COMPLETED:
+                raise IOError("write not confirmed at 0x%08X" % (address + done))
+            done += n
+            if progress:
+                progress(done, len(data))
+
+    def write_image(self, image: bytes, progress: Progress = None,
+                    verify: bool = True) -> bytes:
+        """Write ``image`` region-by-region and verify by read-back.
+        Returns the pre-write backup so the caller can save it."""
+        self.unlock()
+        backup = self.read_image()
+        total = self.profile.total_bytes()
+        done = 0
+
+        def region_progress(cur, _size):
+            if progress:
+                progress(done + cur, total)
+
+        for region in self.profile.regions:
+            seg = image[region.image_offset:region.image_offset + region.size]
+            self.write_region(region.address, seg, region_progress)
+            done += region.size
+        if verify:
+            readback = self.read_image()
+            if readback != image:
+                raise IOError("verify failed: read-back does not match written image")
+        return backup
 
 
 def simulation_link() -> DiagnosticLink:
     """A ready-to-use diagnostic link backed by a simulated ECM."""
     ecu = SimulatedEcu()
     return DiagnosticLink(SimulationTransport(responder=ecu.respond))
+
+
+def simulation_flasher(profile: Optional[modules.ModuleProfile] = None) -> J1939Flasher:
+    """A flasher wired to a simulated ECM sized to a small demo profile."""
+    if profile is None:
+        profile = modules.ModuleProfile(
+            key="SIM", name="Simulated ECM", description="offline demo",
+            protocol="j1939", image_size=0x4000,
+            regions=[modules.Region("cal", 0x0, 0x4000, 0x0)])
+    ecu = SimulatedEcu(image_size=profile.image_size)
+    link = DiagnosticLink(SimulationTransport(responder=ecu.respond))
+    return J1939Flasher(link, profile, security=DemoSecurityProvider())
 
 
 # ---------------------------------------------------------------------------

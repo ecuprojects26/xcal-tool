@@ -24,8 +24,16 @@ Calterm/INSITE calibration files.
   (CES 14602 `.xls`) into a searchable table (Cummins FC ↔ SPN / FMI / P-code /
   lamp / description) and export it as CSV. `.xls` import needs the optional
   `xlrd` package; searching/exporting a saved CSV is standard-library only.
-- **ECU (read/write)** – placeholder tab; the interface is stubbed so live ECU
-  read/write can be added later without changing the rest of the app.
+- **ECU diagnostics + read/write** – connect over J1939 (CAN) or J1587 (J1708)
+  and **Identify** (VIN, ESN, ECFG/calibration version, part no.), **read** /
+  **clear** DTCs, and **read / write the flash image** via J1939 memory access
+  (DM14/DM15/DM16, with BAM multi-packet transfers). Adapters are auto-detected
+  into a dropdown (python-can / RP1210 / J2534 / SocketCAN) plus a built-in
+  **Simulation** ECU. Module profiles: CM870, CM871, CM2250, CM2350, CM2450.
+  A flash read routes straight into the bin / EFILive `_efi.bin` / xcal
+  converters; a write is **backup-first** and **verified by read-back**.
+  Unlocking a real ECU needs an authorized seed/key `SecurityProvider` you
+  supply — **no Cummins security is bypassed or shipped**.
 
 ## Status
 
@@ -41,7 +49,14 @@ Calterm/INSITE calibration files.
   skeleton. XDF element addresses are parameter **ids** (the `.ecfg` addresses by
   id, not raw offset); resolving ids to `.bin` offsets via the module index
   table is a planned follow-up.
-- **ECU (read/write)** — interface only (`comms.py`); no hardware backend yet.
+- **ECU diagnostics + read/write** — J1939/J1587 diagnostics, identify, DTC
+  read/clear, and DM14/15/16 flash read/write are implemented and unit-tested
+  end-to-end against the built-in simulated ECU (read → modify → write →
+  verify, plus a locked-without-key failure). Hardware transports
+  (RP1210/J2534/SocketCAN/python-can) are structurally complete but not yet
+  validated against a physical ECU, and the older module memory maps
+  (CM870/871/2250/2350) need per-ECU verification before writing. Real ECUs
+  require an operator-supplied seed/key module.
 
 ## Requirements
 
@@ -72,8 +87,14 @@ src/xcaltool/
   codec.py             # generic container helpers + checksums glue
   checksum.py          # checksum algorithms
   ecfg.py              # ecfg XML parser + XDF/CSV exporters
-  comms.py             # abstract ECU read/write interface (future)
-  gui.py               # Tkinter UI (3 tabs)
+  comms.py             # diagnostic link + J1939 flasher + simulated ECU
+  j1939.py             # J1939 PGNs, DTCs, BAM, DM14/15/16 memory access
+  j1587.py             # J1587/J1708 messaging + DTC decode
+  transport.py         # Simulation / python-can / RP1210 / J2534 / SocketCAN
+  modules.py           # Cummins ECM module profiles (memory maps)
+  faultcodes.py        # Cummins service fault-code import/search
+  dtc.py               # DTC catalog / classifier
+  gui.py               # Tkinter UI (tabs)
 tests/                 # unit tests
 ```
 

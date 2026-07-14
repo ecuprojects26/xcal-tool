@@ -11,13 +11,13 @@ The GUI only handles user interaction; all real work lives in the codec / ecfg
 
 from __future__ import annotations
 
+import importlib.util
+import json
 import os
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-import json
-
-from . import __version__, comms, dtc, ecfg, faultcodes, transport, xcalfmt
+from . import __version__, comms, dtc, ecfg, faultcodes, modules, transport, xcalfmt
 
 
 def _hex_preview(data: bytes, max_rows: int = 24) -> str:
@@ -579,6 +579,21 @@ class EcuTab(ttk.Frame):
         self.conn_lbl = ttk.Label(row, text="disconnected", foreground="#a00")
         self.conn_lbl.pack(side="left", padx=10)
 
+        row2 = ttk.Frame(self)
+        row2.pack(fill="x", pady=(6, 0))
+        ttk.Label(row2, text="Module:").pack(side="left")
+        self.module = tk.StringVar()
+        self._module_keys = [k for k, _ in modules.profile_labels()]
+        ttk.Combobox(row2, textvariable=self.module, width=34, state="readonly",
+                     values=[n for _, n in modules.profile_labels()]).pack(side="left", padx=6)
+        ttk.Label(row2, text="Security:").pack(side="left", padx=(12, 0))
+        self.security = tk.StringVar(value="None")
+        ttk.Combobox(row2, textvariable=self.security, width=22, state="readonly",
+                     values=["None", "Demo (simulation only)",
+                             "Custom module (.py)"]).pack(side="left", padx=6)
+        if self._module_keys:
+            self.module.set(modules.profile_labels()[-1][1])   # default CM2450
+
         btns = ttk.Frame(self)
         btns.pack(fill="x", pady=8)
         ttk.Button(btns, text="Connect", command=self.connect).pack(side="left")
@@ -589,15 +604,27 @@ class EcuTab(ttk.Frame):
         ttk.Button(btns, text="Load fault-code CSV",
                    command=self.load_faults).pack(side="left", padx=6)
 
+        fbtns = ttk.Frame(self)
+        fbtns.pack(fill="x")
+        ttk.Label(fbtns, text="Flash:").pack(side="left")
+        ttk.Button(fbtns, text="Read image -> file",
+                   command=self.read_image).pack(side="left", padx=6)
+        ttk.Button(fbtns, text="Write image (backup+verify)",
+                   command=self.write_image).pack(side="left")
+        self.prog = ttk.Progressbar(fbtns, length=220, mode="determinate")
+        self.prog.pack(side="left", padx=10)
+
         ttk.Label(
             self,
             text="Simulation runs with no hardware (J1939). RP1210/J2534/"
-                 "SocketCAN need a real adapter. Reading/clearing codes is safe "
-                 "diagnostics; it does not modify the tune.",
+                 "SocketCAN need a real adapter. Read/clear codes is safe "
+                 "diagnostics. Flash read/write use J1939 DM14/15/16 and need an "
+                 "authorized seed/key module for real ECUs; 'Demo' unlocks only "
+                 "the simulator. Writes always back up and verify first.",
             foreground="#555", wraplength=720, justify="left",
         ).pack(anchor="w")
 
-        self.out = tk.Text(self, height=20, wrap="none", font=("Courier", 9))
+        self.out = tk.Text(self, height=18, wrap="none", font=("Courier", 9))
         self.out.pack(fill="both", expand=True, pady=8)
         self.rescan()
 
@@ -721,6 +748,130 @@ class EcuTab(ttk.Frame):
             return
         self._faults = faultcodes.load_csv(path)
         self._log(f"Loaded {len(self._faults):,} fault-code descriptions.")
+
+    # -- flash read/write --------------------------------------------------
+    def _selected_profile(self):
+        idx = [n for _, n in modules.profile_labels()].index(self.module.get())
+        return modules.get_profile(self._module_keys[idx])
+
+    def _build_security(self):
+        choice = self.security.get()
+        if choice.startswith("Demo"):
+            return comms.DemoSecurityProvider()
+        if choice.startswith("Custom"):
+            path = filedialog.askopenfilename(
+                title="Seed/key module (.py exposing key_from_seed(seed, level))",
+                filetypes=[("Python", "*.py")])
+            if not path:
+                return None
+            return _load_security_module(path)
+        return None
+
+    def _build_flasher(self):
+        if not self._need_link():
+            return None
+        try:
+            security = self._build_security()
+        except Exception as exc:
+            messagebox.showerror("Security module", str(exc))
+            return None
+        return comms.J1939Flasher(self.link, self._selected_profile(),
+                                  security=security)
+
+    def _progress(self, done, total):
+        self.prog["maximum"] = total
+        self.prog["value"] = done
+        self.update_idletasks()
+
+    def read_image(self):
+        flasher = self._build_flasher()
+        if flasher is None:
+            return
+        prof = flasher.profile
+        self._log(f"Reading {prof.name} ({prof.total_bytes():,} bytes)...")
+        try:
+            image = flasher.read_image(self._progress)
+        except Exception as exc:
+            messagebox.showerror("Read failed", str(exc))
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save raw image", defaultextension=".bin",
+            filetypes=[("Raw image", "*.bin")])
+        if not path:
+            return
+        with open(path, "wb") as fh:
+            fh.write(image)
+        self._log(f"Saved raw image -> {path} ({len(image):,} bytes)")
+        self._offer_convert(image, path)
+
+    def _offer_convert(self, image, bin_path):
+        if messagebox.askyesno("Convert", "Also convert this image to an EFILive "
+                               "_efi.bin?\n(You'll pick a matching .xcal template "
+                               "for full .xcal rebuild separately.)"):
+            tpl = filedialog.askopenfilename(
+                title="Matching original .xcal (template for EFILive/xcal)",
+                filetypes=[("xcal", "*.xcal *.* ")])
+            if not tpl:
+                return
+            try:
+                with open(tpl, "rb") as fh:
+                    template = fh.read()
+                efi = xcalfmt.build_from_template(image, template)
+                out = os.path.splitext(bin_path)[0] + "_efi.bin"
+                with open(out, "wb") as fh:
+                    fh.write(efi)
+                self._log(f"Wrote EFILive image -> {out}")
+            except Exception as exc:
+                messagebox.showerror("Convert failed", str(exc))
+
+    def write_image(self):
+        flasher = self._build_flasher()
+        if flasher is None:
+            return
+        path = filedialog.askopenfilename(
+            title="Image to write (.bin)", filetypes=[("Raw image", "*.bin")])
+        if not path:
+            return
+        with open(path, "rb") as fh:
+            image = fh.read()
+        prof = flasher.profile
+        if len(image) != prof.image_size:
+            if not messagebox.askyesno(
+                    "Size mismatch",
+                    f"Image is {len(image):,} bytes but {prof.name} expects "
+                    f"{prof.image_size:,}. Continue anyway?"):
+                return
+        if not messagebox.askyesno(
+                "Confirm write",
+                f"WRITE this image to the ECU via {self.backend.get()}?\n\n"
+                "A backup is read first and the write is verified. This changes "
+                "the ECU. Make sure power is stable."):
+            return
+        self._log(f"Writing {prof.name}... (backup first)")
+        try:
+            backup = flasher.write_image(image, self._progress, verify=True)
+        except Exception as exc:
+            messagebox.showerror("Write failed", str(exc))
+            return
+        bpath = os.path.splitext(path)[0] + ".backup.bin"
+        with open(bpath, "wb") as fh:
+            fh.write(backup)
+        self._log(f"Write verified OK. Pre-write backup saved -> {bpath}")
+
+
+def _load_security_module(path):
+    """Load a user seed/key module exposing key_from_seed(seed, level)."""
+    spec = importlib.util.spec_from_file_location("user_security", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    if not hasattr(mod, "key_from_seed"):
+        raise ValueError("module has no key_from_seed(seed, level) function")
+
+    class _Provider(comms.SecurityProvider):
+        def key_from_seed(self, seed, level=1):
+            return mod.key_from_seed(seed, level)
+
+    return _Provider()
 
 
 class App(tk.Tk):

@@ -28,6 +28,9 @@ PGN_COMPONENT_ID = 65259    # 0xFEEB  Make*Model*Serial*Unit
 PGN_SOFTWARE_ID = 65242     # 0xFEDA
 PGN_VEHICLE_ID = 65260      # 0xFEEC  VIN
 PGN_ECU_ID = 64965          # 0xFDC5  ECU part#*serial*location*type*mfr
+PGN_TP_CM = 60416           # 0xEC00  transport-protocol connection management
+PGN_TP_DT = 60160           # 0xEB00  transport-protocol data transfer
+TP_BAM = 0x20               # broadcast-announce control byte
 
 GLOBAL_ADDRESS = 0xFF
 ENGINE_ADDRESS = 0x00       # Cummins engine ECM default source address
@@ -120,6 +123,104 @@ def decode_component_id(data: bytes) -> dict:
     keys = ["make", "model", "serial", "unit"]
     text = [f.decode("latin-1", "replace").strip("\x00 ") for f in fields]
     return {k: (text[i] if i < len(text) else "") for i, k in enumerate(keys)}
+
+
+# --- Memory access (DM14 request / DM15 response / DM16 data) --------------
+PGN_DM14 = 55552            # 0xD900  memory access request  (tester -> ECM)
+PGN_DM15 = 54528            # 0xD500  memory access response (ECM -> tester)
+PGN_DM16 = 53760            # 0xD200  binary data transfer
+
+# DM14 commands
+CMD_ERASE = 0
+CMD_READ = 1
+CMD_WRITE = 2
+CMD_STATUS_REQUEST = 3
+CMD_OP_COMPLETED = 4
+CMD_OP_FAILED = 5
+CMD_BOOT_LOAD = 6
+CMD_EDCP_GENERATION = 7
+
+# DM15 status
+STATUS_PROCEED = 0
+STATUS_BUSY = 1
+STATUS_OP_COMPLETED = 4
+STATUS_OP_FAILED = 5
+
+NO_KEY = 0xFFFF
+
+
+def encode_dm14(num_bytes: int, command: int, address: int,
+                key: int = NO_KEY, pointer_type: int = 0) -> bytes:
+    b0 = num_bytes & 0xFF
+    b1 = ((num_bytes >> 8) & 0x07) | ((pointer_type & 0x01) << 3) | ((command & 0x07) << 5)
+    return bytes([b0, b1]) + (address & 0xFFFFFFFF).to_bytes(4, "little") + \
+        (key & 0xFFFF).to_bytes(2, "little")
+
+
+def decode_dm14(d: bytes) -> dict:
+    return {
+        "num_bytes": d[0] | ((d[1] & 0x07) << 8),
+        "pointer_type": (d[1] >> 3) & 0x01,
+        "command": (d[1] >> 5) & 0x07,
+        "address": int.from_bytes(d[2:6], "little"),
+        "key": int.from_bytes(d[6:8], "little"),
+    }
+
+
+def encode_dm15(num_bytes: int, status: int, seed: int = 0, error: int = 0) -> bytes:
+    b0 = num_bytes & 0xFF
+    b1 = ((num_bytes >> 8) & 0x07) | ((status & 0x07) << 5)
+    return bytes([b0, b1]) + (seed & 0xFFFF).to_bytes(2, "little") + \
+        bytes([error & 0xFF, 0xFF, 0xFF, 0xFF])
+
+
+def decode_dm15(d: bytes) -> dict:
+    return {
+        "num_bytes": d[0] | ((d[1] & 0x07) << 8),
+        "status": (d[1] >> 5) & 0x07,
+        "seed": int.from_bytes(d[2:4], "little"),
+        "error": d[4] if len(d) > 4 else 0,
+    }
+
+
+def encode_dm16(data: bytes) -> bytes:
+    # DM16 carries the raw bytes; the count comes from the preceding DM15's
+    # num_bytes field (blocks can exceed the 255 a single length byte holds).
+    return bytes(data)
+
+
+def decode_dm16(d: bytes) -> bytes:
+    return bytes(d)
+
+
+def build_tp_bam(pgn: int, data: bytes, source: int,
+                 priority: int = 7) -> List[tuple]:
+    """Split ``data`` into a broadcast (BAM) sequence for a large message.
+
+    Returns [(can_id, frame_bytes), ...]: one TP.CM (BAM) announce frame then
+    one TP.DT frame per 7-byte packet. Used to transmit responses that don't
+    fit in a single 8-byte CAN frame (Component ID, VIN, multi-DTC DM1, ...).
+    """
+    n = len(data)
+    npackets = (n + 6) // 7
+    cm = bytes([TP_BAM, n & 0xFF, (n >> 8) & 0xFF, npackets, 0xFF,
+                pgn & 0xFF, (pgn >> 8) & 0xFF, (pgn >> 16) & 0xFF])
+    frames = [(pgn_to_canid(PGN_TP_CM, source, priority, dest=GLOBAL_ADDRESS), cm)]
+    for i in range(npackets):
+        chunk = data[i * 7:(i + 1) * 7].ljust(7, b"\xFF")
+        frames.append((pgn_to_canid(PGN_TP_DT, source, priority, dest=GLOBAL_ADDRESS),
+                       bytes([i + 1]) + chunk))
+    return frames
+
+
+def parse_tp_cm_bam(data: bytes):
+    """Return (total_size, num_packets, pgn) for a TP.CM BAM frame, else None."""
+    if len(data) < 8 or data[0] != TP_BAM:
+        return None
+    total = data[1] | (data[2] << 8)
+    npackets = data[3]
+    pgn = data[5] | (data[6] << 8) | (data[7] << 16)
+    return total, npackets, pgn
 
 
 def decode_vin(data: bytes) -> str:

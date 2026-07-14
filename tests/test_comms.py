@@ -3,7 +3,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from xcaltool import comms, j1587, j1939  # noqa: E402
+from xcaltool import comms, j1587, j1939, modules  # noqa: E402
 from xcaltool.faultcodes import FaultCode  # noqa: E402
 
 
@@ -60,6 +60,61 @@ def test_simulation_identify_read_clear():
         assert any(d.spn == 3251 for d in active)
         link.clear_dtcs(active=True)
         assert link.read_dtcs(active=True) == []
+
+
+def test_tp_bam_roundtrip():
+    data = bytes(range(60))                         # > 8 bytes -> multi-packet
+    frames = j1939.build_tp_bam(j1939.PGN_COMPONENT_ID, data, source=0)
+    cm = j1939.parse_tp_cm_bam(frames[0][1])
+    assert cm[0] == len(data) and cm[2] == j1939.PGN_COMPONENT_ID
+    buf = bytearray()
+    for _cid, fr in frames[1:]:
+        buf += fr[1:8]
+    assert bytes(buf[:len(data)]) == data
+
+
+def test_dm14_dm15_codec():
+    d14 = j1939.encode_dm14(256, j1939.CMD_READ, 0x840000, key=0x1234)
+    m = j1939.decode_dm14(d14)
+    assert m["num_bytes"] == 256 and m["command"] == j1939.CMD_READ
+    assert m["address"] == 0x840000 and m["key"] == 0x1234
+    d15 = j1939.encode_dm15(256, j1939.STATUS_PROCEED, seed=0xBEEF)
+    s = j1939.decode_dm15(d15)
+    assert s["num_bytes"] == 256 and s["status"] == j1939.STATUS_PROCEED
+    assert s["seed"] == 0xBEEF
+
+
+def test_module_profiles_present():
+    keys = modules.profile_keys()
+    for k in ("CM870", "CM871", "CM2250", "CM2350", "CM2450"):
+        assert k in keys
+    assert modules.guess_profile("CM24xx").key == "CM2450"
+
+
+def test_simulation_flash_read_write_verify():
+    flasher = comms.simulation_flasher()
+    flasher.connect()
+    image = flasher.read_image()
+    assert len(image) == flasher.profile.image_size
+    modified = bytearray(image)
+    modified[0:4] = b"\xDE\xAD\xBE\xEF"
+    backup = flasher.write_image(bytes(modified))     # verifies by read-back
+    assert backup == image
+    assert flasher.read_image() == bytes(modified)
+    flasher.disconnect()
+
+
+def test_flash_locked_without_security():
+    flasher = comms.simulation_flasher()
+    flasher.security = None                            # no key provider
+    flasher.connect()
+    try:
+        flasher.read_image()
+        assert False, "expected SecurityError"
+    except comms.SecurityError:
+        pass
+    finally:
+        flasher.disconnect()
 
 
 def test_annotate_descriptions():
