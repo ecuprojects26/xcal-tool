@@ -13,12 +13,11 @@ from __future__ import annotations
 
 import os
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import json
 
-from . import __version__, dtc, ecfg, faultcodes, xcalfmt
-from .comms import NotConnectedBackend
+from . import __version__, comms, dtc, ecfg, faultcodes, transport, xcalfmt
 
 
 def _hex_preview(data: bytes, max_rows: int = 24) -> str:
@@ -557,25 +556,159 @@ class FaultCodeTab(ttk.Frame):
 
 
 class EcuTab(ttk.Frame):
-    """Placeholder tab for future ECU read/write."""
+    """Diagnostics: connect, identify, read & clear fault codes."""
 
     def __init__(self, master):
         super().__init__(master, padding=10)
-        self.backend = NotConnectedBackend()
+        self.link = None
+        self._faults = []
+
+        row = ttk.Frame(self)
+        row.pack(fill="x")
+        ttk.Label(row, text="Adapter:").pack(side="left")
+        self.backend = tk.StringVar(value="Simulation")
+        ttk.Combobox(row, textvariable=self.backend, width=20, state="readonly",
+                     values=transport.list_backends()).pack(side="left", padx=6)
+        ttk.Label(row, text="Protocol:").pack(side="left")
+        self.proto = tk.StringVar(value="j1939")
+        ttk.Combobox(row, textvariable=self.proto, width=8, state="readonly",
+                     values=["j1939", "j1587"]).pack(side="left", padx=6)
+        self.conn_lbl = ttk.Label(row, text="disconnected", foreground="#a00")
+        self.conn_lbl.pack(side="left", padx=10)
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", pady=8)
+        ttk.Button(btns, text="Connect", command=self.connect).pack(side="left")
+        ttk.Button(btns, text="Disconnect", command=self.disconnect).pack(side="left", padx=6)
+        ttk.Button(btns, text="Identify", command=self.identify).pack(side="left")
+        ttk.Button(btns, text="Read codes", command=self.read_codes).pack(side="left", padx=6)
+        ttk.Button(btns, text="Clear codes", command=self.clear_codes).pack(side="left")
+        ttk.Button(btns, text="Load fault-code CSV",
+                   command=self.load_faults).pack(side="left", padx=6)
+
         ttk.Label(
             self,
-            text="Live ECU read/write is planned. The interface is stubbed so "
-                 "it can be added without changing the rest of the app.",
-            wraplength=520, justify="left",
-        ).pack(anchor="w", pady=(0, 10))
-        ttk.Button(self, text="Read from ECU", command=self._todo).pack(anchor="w")
-        ttk.Button(self, text="Write to ECU", command=self._todo).pack(anchor="w", pady=6)
+            text="Simulation runs with no hardware (J1939). RP1210/J2534/"
+                 "SocketCAN need a real adapter. Reading/clearing codes is safe "
+                 "diagnostics; it does not modify the tune.",
+            foreground="#555", wraplength=720, justify="left",
+        ).pack(anchor="w")
 
-    def _todo(self):
+        self.out = tk.Text(self, height=20, wrap="none", font=("Courier", 9))
+        self.out.pack(fill="both", expand=True, pady=8)
+
+    def _log(self, text):
+        self.out.insert("end", text + "\n")
+        self.out.see("end")
+
+    def _build_link(self):
+        name = self.backend.get()
+        proto = self.proto.get()
+        if name == "Simulation":
+            if proto != "j1939":
+                messagebox.showinfo("xcaltool", "Simulation currently models a "
+                                    "J1939 ECM. Switch protocol to j1939.")
+                return None
+            return comms.simulation_link()
+        if name.startswith("RP1210"):
+            dll = simpledialog.askstring("RP1210", "Vendor DLL name (e.g. NULN2R32):")
+            if not dll:
+                return None
+            t = transport.Rp1210Transport(dll, protocol=proto)
+        elif name.startswith("J2534"):
+            dll = filedialog.askopenfilename(title="J2534 DLL", filetypes=[("DLL", "*.dll")])
+            if not dll:
+                return None
+            t = transport.J2534Transport(dll)
+        else:
+            chan = simpledialog.askstring("SocketCAN", "CAN interface:", initialvalue="can0")
+            if not chan:
+                return None
+            t = transport.SocketCanTransport(chan)
+        t.protocol = proto
+        return comms.DiagnosticLink(t)
+
+    def connect(self):
+        self.link = self._build_link()
+        if self.link is None:
+            return
         try:
-            self.backend.connect()
-        except NotImplementedError as exc:
-            messagebox.showinfo("Coming soon", str(exc))
+            self.link.connect()
+        except Exception as exc:                       # hardware/driver errors
+            self.link = None
+            messagebox.showerror("Connect failed", str(exc))
+            return
+        self.conn_lbl.config(text=f"connected ({self.backend.get()})", foreground="#080")
+        self._log(f"Connected via {self.backend.get()} [{self.proto.get()}].")
+
+    def disconnect(self):
+        if self.link:
+            self.link.disconnect()
+            self.link = None
+        self.conn_lbl.config(text="disconnected", foreground="#a00")
+
+    def _need_link(self):
+        if self.link is None:
+            messagebox.showinfo("xcaltool", "Connect first.")
+            return False
+        return True
+
+    def identify(self):
+        if not self._need_link():
+            return
+        try:
+            info = self.link.identify()
+        except Exception as exc:
+            messagebox.showerror("Identify failed", str(exc))
+            return
+        self._log("-- ECU identity --")
+        self._log(f"  make/model : {info.make} {info.model}".rstrip())
+        self._log(f"  serial     : {info.serial}")
+        self._log(f"  calibration: {info.calibration_id}")
+        if info.software:
+            self._log(f"  software   : {', '.join(info.software)}")
+
+    def read_codes(self):
+        if not self._need_link():
+            return
+        try:
+            active = self.link.read_dtcs(active=True)
+            prev = self.link.read_dtcs(active=False)
+        except Exception as exc:
+            messagebox.showerror("Read failed", str(exc))
+            return
+        if self._faults:
+            comms.annotate_descriptions(active, self._faults)
+            comms.annotate_descriptions(prev, self._faults)
+        self._log(f"-- Active codes ({len(active)}) --")
+        for d in active:
+            self._log("  " + d.label())
+        self._log(f"-- Previously active ({len(prev)}) --")
+        for d in prev:
+            self._log("  " + d.label())
+
+    def clear_codes(self):
+        if not self._need_link():
+            return
+        if not messagebox.askyesno("Clear codes", "Clear active and previously "
+                                   "active fault codes on the ECU?"):
+            return
+        try:
+            self.link.clear_dtcs(active=True)
+            self.link.clear_dtcs(active=False)
+        except Exception as exc:
+            messagebox.showerror("Clear failed", str(exc))
+            return
+        self._log("Cleared active and previously-active codes.")
+
+    def load_faults(self):
+        path = filedialog.askopenfilename(
+            title="Load Cummins fault-code CSV (for descriptions)",
+            filetypes=[("CSV", "*.csv")])
+        if not path:
+            return
+        self._faults = faultcodes.load_csv(path)
+        self._log(f"Loaded {len(self._faults):,} fault-code descriptions.")
 
 
 class App(tk.Tk):
@@ -589,7 +722,7 @@ class App(tk.Tk):
         nb.add(EcfgTab(nb), text="ecfg -> xdf/csv")
         nb.add(DtcTab(nb), text="DTC catalog")
         nb.add(FaultCodeTab(nb), text="Fault codes")
-        nb.add(EcuTab(nb), text="ECU (read/write)")
+        nb.add(EcuTab(nb), text="ECU diagnostics")
 
 
 def main():
