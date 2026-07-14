@@ -12,6 +12,11 @@ Calterm/INSITE calibration files.
   (the smaller file you flash/edit) and rebuild the `.xcal` from it. The high
   calibration bank (0x840000+) is shifted down by 0x7C0000 so the file stays a
   sensible size instead of a 32 MB flat image. Verified byte-exact on CM24xx.
+- **Batch convert** – point at a folder and convert every `.xcal` in it to both
+  the flat `.bin` and EFILive `_efi.bin` in one pass.
+- **Compare** – diff two calibration files (`.bin` or `.xcal`); nearby changed
+  bytes are grouped into diff runs so you can see exactly what a tune changed,
+  and save a diff report.
 - **ecfg → xdf/csv** – turn a Cummins `.ecfg` definition into a TunerPro `.xdf`
   or a `.csv` table.
 - **DTC catalog** – from an `.ecfg`, list the fault-code / diagnostic parameters,
@@ -34,6 +39,12 @@ Calterm/INSITE calibration files.
   converters; a write is **backup-first** and **verified by read-back**.
   Unlocking a real ECU needs an authorized seed/key `SecurityProvider` you
   supply — **no Cummins security is bypassed or shipped**.
+- **Live data** – stream broadcast J1939 telemetry (engine speed, coolant/oil/
+  fuel/intake temps, oil & fuel pressure, boost, fuel rate, battery, vehicle
+  speed, fuel & DEF level, engine hours, odometer) into a live readout and log
+  it to CSV.
+- **Service report** – save a one-page text report (ECU data tag, decoded VIN,
+  active/previously-active codes, image CRC32/SHA-256 integrity).
 
 ## Status
 
@@ -72,6 +83,18 @@ No third-party packages are required to run the app.
 python run.py
 ```
 
+## Build a Windows .exe (no Python needed on the target PC)
+
+From the repo root on Windows:
+
+```bat
+packaging\build_exe.bat
+```
+
+This produces a single self-contained `dist\xcaltool.exe`. It uses 32-bit
+Python (`py -3-32`) so the Nexiq RP1210 driver (`NULN2R32.dll`, which is
+32-bit) can load at runtime.
+
 ## Test
 
 ```bash
@@ -94,7 +117,12 @@ src/xcaltool/
   modules.py           # Cummins ECM module profiles (memory maps)
   faultcodes.py        # Cummins service fault-code import/search
   dtc.py               # DTC catalog / classifier
+  livedata.py          # J1939 broadcast telemetry poller
+  calcompare.py        # calibration image diff
+  batch.py             # batch folder conversion
+  report.py            # VIN decode + integrity hashes + service report
   gui.py               # Tkinter UI (tabs)
+packaging/             # PyInstaller spec + Windows build_exe.bat
 tests/                 # unit tests
 ```
 

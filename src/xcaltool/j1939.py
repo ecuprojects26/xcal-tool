@@ -256,3 +256,113 @@ def decode_engine_config(data: bytes) -> dict:
         if raw not in (0xFFFF, 0xFE00):
             out["rated_speed_rpm"] = raw * 0.125
     return out
+
+
+# --- Live telemetry (broadcast parameter groups) --------------------------
+# PGNs carrying real-time engine parameters. These are broadcast on the bus
+# but Cummins ECMs also answer a request for them, which is how we poll.
+PGN_EEC1 = 61444            # 0xF004  Electronic Engine Controller 1
+PGN_EEC2 = 61443            # 0xF003  Electronic Engine Controller 2
+PGN_ET1 = 65262            # 0xFEEE  Engine Temperature 1
+PGN_EFLP1 = 65263          # 0xFEEF  Engine Fluid Level/Pressure 1
+PGN_IC1 = 65270            # 0xFEF6  Inlet/Exhaust Conditions 1
+PGN_LFE1 = 65266           # 0xFEF2  Fuel Economy (liquid)
+PGN_VEP1 = 65271           # 0xFEF7  Vehicle Electrical Power 1
+PGN_HOURS = 65253          # 0xFEE5  Engine Hours/Revolutions
+PGN_VDHR = 65217           # 0xFEC1  High Resolution Vehicle Distance
+PGN_CCVS = 65265           # 0xFEF1  Cruise Control/Vehicle Speed
+PGN_DD1 = 65276            # 0xFEFC  Dash Display (fuel level)
+PGN_AT1T1 = 65110          # 0xFE56  Aftertreatment 1 Tank 1 (DEF level)
+
+
+def _u16le(data: bytes, i: int):
+    """Little-endian 16-bit at ``i``; None if missing or 'not available'."""
+    if len(data) < i + 2:
+        return None
+    raw = data[i] | (data[i + 1] << 8)
+    return None if raw >= 0xFE00 else raw
+
+
+def _u8(data: bytes, i: int):
+    if len(data) <= i:
+        return None
+    raw = data[i]
+    return None if raw >= 0xFE else raw
+
+
+def _u32le(data: bytes, i: int):
+    if len(data) < i + 4:
+        return None
+    raw = int.from_bytes(data[i:i + 4], "little")
+    return None if raw >= 0xFAFFFFFF else raw
+
+
+def decode_live(pgn: int, data: bytes) -> dict:
+    """Decode recognised broadcast telemetry PGNs into a {key: value} dict.
+    Values are engineering units (rpm, degC, kPa, L/h, V, %, h, km, km/h).
+    Missing/not-available signals are simply omitted."""
+    out: dict = {}
+    if pgn == PGN_EEC1:
+        v = _u16le(data, 3)                       # SPN 190, 0.125 rpm/bit
+        if v is not None:
+            out["engine_rpm"] = round(v * 0.125, 1)
+    elif pgn == PGN_EEC2:
+        v = _u8(data, 1)                          # SPN 91 accel pedal, 0.4 %/bit
+        if v is not None:
+            out["accel_pedal_pct"] = round(v * 0.4, 1)
+        v = _u8(data, 2)                          # SPN 92 engine load, 1 %/bit
+        if v is not None:
+            out["engine_load_pct"] = float(v)
+    elif pgn == PGN_ET1:
+        v = _u8(data, 0)                          # SPN 110, 1 degC/bit, -40
+        if v is not None:
+            out["coolant_c"] = v - 40
+        v = _u8(data, 1)                          # SPN 174 fuel temp, 1 degC, -40
+        if v is not None:
+            out["fuel_temp_c"] = v - 40
+        v = _u16le(data, 2)                       # SPN 175 oil temp, 0.03125, -273
+        if v is not None:
+            out["oil_temp_c"] = round(v * 0.03125 - 273, 1)
+    elif pgn == PGN_EFLP1:
+        v = _u8(data, 3)                          # SPN 100 oil pressure, 4 kPa/bit
+        if v is not None:
+            out["oil_pressure_kpa"] = v * 4
+        v = _u8(data, 0)                          # SPN 94 fuel delivery, 4 kPa/bit
+        if v is not None:
+            out["fuel_pressure_kpa"] = v * 4
+    elif pgn == PGN_IC1:
+        v = _u8(data, 1)                          # SPN 102 boost, 2 kPa/bit
+        if v is not None:
+            out["boost_kpa"] = v * 2
+        v = _u8(data, 2)                          # SPN 105 intake temp, 1 degC, -40
+        if v is not None:
+            out["intake_temp_c"] = v - 40
+    elif pgn == PGN_LFE1:
+        v = _u16le(data, 0)                       # SPN 183 fuel rate, 0.05 L/h
+        if v is not None:
+            out["fuel_rate_lph"] = round(v * 0.05, 1)
+    elif pgn == PGN_VEP1:
+        v = _u16le(data, 4)                       # SPN 168 battery, 0.05 V/bit
+        if v is not None:
+            out["battery_v"] = round(v * 0.05, 2)
+    elif pgn == PGN_HOURS:
+        v = _u32le(data, 0)                       # SPN 247 total hours, 0.05 h/bit
+        if v is not None:
+            out["engine_hours"] = round(v * 0.05, 1)
+    elif pgn == PGN_VDHR:
+        v = _u32le(data, 0)                       # SPN 917 distance, 5 m/bit
+        if v is not None:
+            out["distance_km"] = round(v * 5 / 1000.0, 1)
+    elif pgn == PGN_CCVS:
+        v = _u16le(data, 1)                       # SPN 84 speed, 1/256 km/h
+        if v is not None:
+            out["vehicle_speed_kmh"] = round(v / 256.0, 1)
+    elif pgn == PGN_DD1:
+        v = _u8(data, 1)                          # SPN 96 fuel level, 0.4 %/bit
+        if v is not None:
+            out["fuel_level_pct"] = round(v * 0.4, 1)
+    elif pgn == PGN_AT1T1:
+        v = _u8(data, 0)                          # SPN 1761 DEF level, 0.4 %/bit
+        if v is not None:
+            out["def_level_pct"] = round(v * 0.4, 1)
+    return out

@@ -301,6 +301,7 @@ class SimulatedEcu:
         cfg[31] = int(1800 / 0.125) & 0xFF
         cfg[32] = (int(1800 / 0.125) >> 8) & 0xFF
         self.engine_config = bytes(cfg)
+        self.live = self._build_live_frames()
         self.active = [
             j1939.J1939Dtc(spn=3251, fmi=2, occurrence_count=5),   # DPF pressure
             j1939.J1939Dtc(spn=1569, fmi=31, occurrence_count=1),  # fuel derate
@@ -315,6 +316,43 @@ class SimulatedEcu:
         self.unlocked = False
         self._pending_write = None          # (address, num_bytes)
         self._rx_bam = None                 # (pgn, total, buf) incoming BAM
+
+    def _build_live_frames(self) -> dict:
+        """Realistic warm-idle telemetry, one 8-byte frame per PGN, encoded so
+        that :func:`j1939.decode_live` returns sensible engineering values."""
+        def et1(cool, fuel, oil):
+            oraw = int((oil + 273) / 0.03125)
+            return bytes([cool + 40, fuel + 40, oraw & 0xFF,
+                          (oraw >> 8) & 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+        rpm = int(700 / 0.125)
+        speed = int(0 * 256)
+        return {
+            j1939.PGN_EEC1: bytes([0xFF, 0xFF, 0xFF, rpm & 0xFF,
+                                   (rpm >> 8) & 0xFF, 0xFF, 0xFF, 0xFF]),
+            j1939.PGN_EEC2: bytes([0xFF, int(0 / 0.4), 22, 0xFF,
+                                   0xFF, 0xFF, 0xFF, 0xFF]),
+            j1939.PGN_ET1: et1(88, 40, 95.0),
+            j1939.PGN_EFLP1: bytes([int(420 / 4), 0xFF, 0xFF, int(340 / 4),
+                                    0xFF, 0xFF, 0xFF, 0xFF]),
+            j1939.PGN_IC1: bytes([0xFF, int(0 / 2), 35 + 40, 0xFF,
+                                  0xFF, 0xFF, 0xFF, 0xFF]),
+            j1939.PGN_LFE1: bytes([int(4.5 / 0.05) & 0xFF,
+                                   (int(4.5 / 0.05) >> 8) & 0xFF,
+                                   0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]),
+            j1939.PGN_VEP1: bytes([0xFF, 0xFF, 0xFF, 0xFF,
+                                   int(13.8 / 0.05) & 0xFF,
+                                   (int(13.8 / 0.05) >> 8) & 0xFF, 0xFF, 0xFF]),
+            j1939.PGN_CCVS: bytes([0xFF, speed & 0xFF, (speed >> 8) & 0xFF,
+                                   0xFF, 0xFF, 0xFF, 0xFF, 0xFF]),
+            j1939.PGN_DD1: bytes([0xFF, int(78 / 0.4), 0xFF, 0xFF,
+                                  0xFF, 0xFF, 0xFF, 0xFF]),
+            j1939.PGN_AT1T1: bytes([int(65 / 0.4), 0xFF, 0xFF, 0xFF,
+                                    0xFF, 0xFF, 0xFF, 0xFF]),
+            j1939.PGN_HOURS: (int(4213.5 / 0.05)).to_bytes(4, "little")
+            + b"\xFF\xFF\xFF\xFF",
+            j1939.PGN_VDHR: (int(812345 * 1000 / 5)).to_bytes(4, "little")
+            + b"\xFF\xFF\xFF\xFF",
+        }
 
     # -- incoming frame handling (with BAM reassembly) ---------------------
     def respond(self, frame: CanFrame) -> List[CanFrame]:
@@ -360,6 +398,7 @@ class SimulatedEcu:
             j1939.PGN_DM1: j1939.encode_dm(self.active),
             j1939.PGN_DM2: j1939.encode_dm(self.previously_active),
         }
+        table.update(self.live)
         if req in table:
             return self._emit(req, table[req])
         if req == j1939.PGN_DM11:

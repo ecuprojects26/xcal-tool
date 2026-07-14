@@ -1,17 +1,22 @@
 """Tkinter GUI for xcaltool.
 
-Three tabs:
-  1. xcal <-> bin   -- convert calibration containers to raw images and back
-  2. ecfg -> xdf/csv -- turn a Cummins ECFG definition into TunerPro XDF / CSV
-  3. ECU (read/write) -- placeholder for future live ECU support
+Tabs:
+  1. xcal <-> bin      -- convert calibration containers to raw images and back
+  2. Batch convert     -- convert a whole folder of .xcal to bin + EFILive bin
+  3. Compare           -- diff two calibration images
+  4. ecfg -> xdf/csv   -- turn a Cummins ECFG definition into TunerPro XDF / CSV
+  5. DTC catalog       -- classify ecfg diagnostic parameters
+  6. Fault codes       -- searchable Cummins service fault-code table
+  7. ECU diagnostics   -- connect / identify / DTCs / flash / live data / report
 
-The GUI only handles user interaction; all real work lives in the codec / ecfg
-/ comms modules so it stays easy to follow.
+The GUI only handles user interaction; all real work lives in the library
+modules so it stays easy to follow.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import datetime
 import importlib.util
 import json
 import os
@@ -19,7 +24,8 @@ import struct
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from . import __version__, comms, dtc, ecfg, faultcodes, modules, transport, xcalfmt
+from . import (__version__, batch, calcompare, comms, dtc, ecfg, faultcodes,
+               livedata, modules, report, transport, xcalfmt)
 
 
 def _hex_preview(data: bytes, max_rows: int = 24) -> str:
@@ -564,6 +570,12 @@ class EcuTab(ttk.Frame):
         super().__init__(master, padding=10)
         self.link = None
         self._faults = []
+        self._info = None
+        self._active = []
+        self._prev = []
+        self._live_reader = None
+        self._live_job = None
+        self._live_csv = None
 
         row = ttk.Frame(self)
         row.pack(fill="x")
@@ -616,6 +628,17 @@ class EcuTab(ttk.Frame):
         self.prog = ttk.Progressbar(fbtns, length=220, mode="determinate")
         self.prog.pack(side="left", padx=10)
 
+        lrow = ttk.Frame(self)
+        lrow.pack(fill="x", pady=(4, 0))
+        ttk.Label(lrow, text="Live data:").pack(side="left")
+        self.live_btn = ttk.Button(lrow, text="Start stream",
+                                   command=self.toggle_live)
+        self.live_btn.pack(side="left", padx=6)
+        ttk.Button(lrow, text="Log to CSV...",
+                   command=self.start_live_csv).pack(side="left")
+        ttk.Button(lrow, text="Save report...",
+                   command=self.save_report).pack(side="left", padx=(12, 0))
+
         # Two-column grid (row, col = divmod(index, 2)); ECU CODE at index 3
         # sits directly under ESN (index 1).
         self._id_fields = [
@@ -635,6 +658,20 @@ class EcuTab(ttk.Frame):
             self._id_vars[key] = var
             ttk.Label(tag, textvariable=var, width=30, anchor="w",
                       font=("Courier", 9)).grid(row=r, column=c * 2 + 1, sticky="w")
+
+        self._live_vars = {}
+        live = ttk.LabelFrame(self, text="Live data", padding=8)
+        live.pack(fill="x", pady=(4, 0))
+        for i, sig in enumerate(livedata.SIGNALS):
+            r, c = divmod(i, 3)
+            ttk.Label(live, text=sig.label + ":", width=13,
+                      anchor="e").grid(row=r, column=c * 2, sticky="e",
+                                       padx=(4, 4), pady=1)
+            var = tk.StringVar(value="—")
+            self._live_vars[sig.key] = var
+            ttk.Label(live, textvariable=var, width=10, anchor="w",
+                      font=("Courier", 9)).grid(row=r, column=c * 2 + 1,
+                                                sticky="w")
 
         ttk.Label(
             self,
@@ -718,6 +755,8 @@ class EcuTab(ttk.Frame):
         self.identify()                                # auto-ID + fill data tag
 
     def disconnect(self):
+        self._live_reader = None
+        self._stop_live()
         if self.link:
             self.link.disconnect()
             self.link = None
@@ -738,6 +777,7 @@ class EcuTab(ttk.Frame):
         except Exception as exc:
             messagebox.showerror("Identify failed", str(exc))
             return
+        self._info = info
         self._set_datatag(info)
         self._log("-- ECU identity --")
         for label, key in self._id_fields:
@@ -759,6 +799,7 @@ class EcuTab(ttk.Frame):
         if self._faults:
             comms.annotate_descriptions(active, self._faults)
             comms.annotate_descriptions(prev, self._faults)
+        self._active, self._prev = active, prev
         self._log(f"-- Active codes ({len(active)}) --")
         for d in active:
             self._log("  " + d.label())
@@ -788,6 +829,78 @@ class EcuTab(ttk.Frame):
             return
         self._faults = faultcodes.load_csv(path)
         self._log(f"Loaded {len(self._faults):,} fault-code descriptions.")
+
+    # -- live data ---------------------------------------------------------
+    def toggle_live(self):
+        if self._live_job is not None:
+            self._stop_live()
+            return
+        if not self._need_link():
+            return
+        self._live_reader = livedata.LiveDataReader(self.link)
+        self.live_btn.config(text="Stop stream")
+        self._log("-- live data started --")
+        self._poll_live()
+
+    def _stop_live(self):
+        if self._live_job is not None:
+            self.after_cancel(self._live_job)
+            self._live_job = None
+        if self._live_csv is not None:
+            self._live_csv.close()
+            self._live_csv = None
+            self._log("Live CSV log closed.")
+        self.live_btn.config(text="Start stream")
+
+    def _poll_live(self):
+        if self._live_reader is None:
+            return
+        try:
+            values = self._live_reader.poll()
+        except Exception as exc:
+            self._log(f"Live data stopped: {exc}")
+            self._stop_live()
+            return
+        for sig in livedata.SIGNALS:
+            if sig.key in values:
+                self._live_vars[sig.key].set(
+                    f"{livedata.format_value(values[sig.key])} {sig.unit}")
+        if self._live_csv is not None:
+            ts = datetime.datetime.now().strftime("%H:%M:%S")
+            cols = [ts] + [livedata.format_value(values.get(s.key, ""))
+                           if s.key in values else ""
+                           for s in livedata.SIGNALS]
+            self._live_csv.write(",".join(str(c) for c in cols) + "\n")
+            self._live_csv.flush()
+        self._live_job = self.after(500, self._poll_live)
+
+    def start_live_csv(self):
+        path = filedialog.asksaveasfilename(
+            title="Log live data to CSV", defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")])
+        if not path:
+            return
+        self._live_csv = open(path, "w", encoding="utf-8")
+        header = ["time"] + [f"{s.label} ({s.unit})" for s in livedata.SIGNALS]
+        self._live_csv.write(",".join(header) + "\n")
+        self._log(f"Logging live data -> {path}")
+        if self._live_job is None:
+            self.toggle_live()
+
+    # -- report ------------------------------------------------------------
+    def save_report(self):
+        if self._info is None:
+            messagebox.showinfo("xcaltool", "Connect/Identify first.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save service report", defaultextension=".txt",
+            filetypes=[("Text", "*.txt")])
+        if not path:
+            return
+        text = report.build_report(self._info, self._active, self._prev)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        self._log(f"Saved service report -> {path}")
 
     # -- flash read/write --------------------------------------------------
     def _selected_profile(self):
@@ -929,14 +1042,138 @@ def _load_security_module(path):
     return _Provider()
 
 
+class CompareTab(ttk.Frame):
+    """Diff two calibration images (.bin/.xcal) and show what changed."""
+
+    def __init__(self, master):
+        super().__init__(master, padding=10)
+        self._path_a = ""
+        self._path_b = ""
+
+        row = ttk.Frame(self)
+        row.pack(fill="x")
+        ttk.Button(row, text="File A...",
+                   command=lambda: self._pick("a")).pack(side="left")
+        self.lbl_a = ttk.Label(row, text="(none)")
+        self.lbl_a.pack(side="left", padx=8)
+        row2 = ttk.Frame(self)
+        row2.pack(fill="x", pady=(4, 0))
+        ttk.Button(row2, text="File B...",
+                   command=lambda: self._pick("b")).pack(side="left")
+        self.lbl_b = ttk.Label(row2, text="(none)")
+        self.lbl_b.pack(side="left", padx=8)
+
+        act = ttk.Frame(self)
+        act.pack(fill="x", pady=8)
+        ttk.Button(act, text="Compare", command=self.compare).pack(side="left")
+        ttk.Button(act, text="Save diff report...",
+                   command=self.save_report).pack(side="left", padx=6)
+        ttk.Label(
+            self,
+            text="Accepts .xcal or .bin on either side (each is reduced to its "
+                 "raw flash image first). Nearby changed bytes are grouped into "
+                 "one diff run so a changed value/table shows as a single entry.",
+            foreground="#555", wraplength=720, justify="left").pack(anchor="w")
+
+        self.out = tk.Text(self, height=26, wrap="none", font=("Courier", 9))
+        self.out.pack(fill="both", expand=True, pady=8)
+        self._result = None
+
+    def _pick(self, which):
+        path = filedialog.askopenfilename(
+            title=f"Calibration file {which.upper()}",
+            filetypes=[("xcal/bin", "*.xcal *.bin"), ("all files", "*.*")])
+        if not path:
+            return
+        if which == "a":
+            self._path_a = path
+            self.lbl_a.config(text=os.path.basename(path))
+        else:
+            self._path_b = path
+            self.lbl_b.config(text=os.path.basename(path))
+
+    def compare(self):
+        if not (self._path_a and self._path_b):
+            messagebox.showinfo("xcaltool", "Pick both File A and File B.")
+            return
+        try:
+            with open(self._path_a, "rb") as fh:
+                a = calcompare.load_image(fh.read())
+            with open(self._path_b, "rb") as fh:
+                b = calcompare.load_image(fh.read())
+        except Exception as exc:
+            messagebox.showerror("Compare failed", str(exc))
+            return
+        self._result = calcompare.compare_images(a, b)
+        self.out.delete("1.0", "end")
+        self.out.insert("end", calcompare.format_report(self._result))
+
+    def save_report(self):
+        if self._result is None:
+            messagebox.showinfo("xcaltool", "Run a compare first.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save diff report", defaultextension=".txt",
+            filetypes=[("Text", "*.txt")])
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(calcompare.format_report(self._result, limit=100000))
+        messagebox.showinfo("xcaltool", f"Saved -> {path}")
+
+
+class BatchTab(ttk.Frame):
+    """Batch-convert every .xcal in a folder to .bin + EFILive _efi.bin."""
+
+    def __init__(self, master):
+        super().__init__(master, padding=10)
+        row = ttk.Frame(self)
+        row.pack(fill="x")
+        ttk.Button(row, text="Choose folder & convert...",
+                   command=self.run).pack(side="left")
+        self.prog = ttk.Progressbar(row, length=240, mode="determinate")
+        self.prog.pack(side="left", padx=10)
+        ttk.Label(
+            self,
+            text="Finds every .xcal in the chosen folder (non-recursive) and "
+                 "writes <name>.bin (flat) and <name>_efi.bin (EFILive compact) "
+                 "next to each one.",
+            foreground="#555", wraplength=720, justify="left").pack(anchor="w")
+        self.out = tk.Text(self, height=26, wrap="none", font=("Courier", 9))
+        self.out.pack(fill="both", expand=True, pady=8)
+
+    def run(self):
+        folder = filedialog.askdirectory(title="Folder of .xcal files")
+        if not folder:
+            return
+        self.out.delete("1.0", "end")
+
+        def progress(done, total, name):
+            self.prog["maximum"] = max(total, 1)
+            self.prog["value"] = done
+            self.out.insert("end", f"[{done}/{total}] {name}\n")
+            self.out.see("end")
+            self.update_idletasks()
+
+        items = batch.convert_folder(folder, progress)
+        ok = sum(1 for it in items if it.ok)
+        self.out.insert("end", f"\nDone: {ok}/{len(items)} converted.\n")
+        for it in items:
+            if not it.ok:
+                self.out.insert("end", f"  FAILED {os.path.basename(it.source)}: "
+                                       f"{it.error}\n")
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"xcaltool {__version__}")
-        self.geometry("760x620")
+        self.geometry("820x680")
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True)
         nb.add(XcalBinTab(nb), text="xcal <-> bin")
+        nb.add(BatchTab(nb), text="Batch convert")
+        nb.add(CompareTab(nb), text="Compare")
         nb.add(EcfgTab(nb), text="ecfg -> xdf/csv")
         nb.add(DtcTab(nb), text="DTC catalog")
         nb.add(FaultCodeTab(nb), text="Fault codes")
