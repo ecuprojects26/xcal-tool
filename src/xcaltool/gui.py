@@ -610,7 +610,19 @@ class EcuTab(ttk.Frame):
                                     "J1939 ECM. Switch protocol to j1939.")
                 return None
             return comms.simulation_link()
-        if name.startswith("RP1210"):
+        if name.startswith("python-can"):
+            iface = simpledialog.askstring(
+                "python-can", "Interface (socketcan / slcan / pcan / kvaser / "
+                "vector / usb2can):", initialvalue="slcan")
+            if not iface:
+                return None
+            chan = simpledialog.askstring(
+                "python-can", "Channel (e.g. can0, COM5, PCAN_USBBUS1):",
+                initialvalue="COM5")
+            if not chan:
+                return None
+            t = transport.PythonCanTransport(interface=iface, channel=chan)
+        elif name.startswith("RP1210"):
             dll = simpledialog.askstring("RP1210", "Vendor DLL name (e.g. NULN2R32):")
             if not dll:
                 return None

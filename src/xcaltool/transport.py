@@ -233,5 +233,51 @@ class SocketCanTransport(Transport):
         return CanFrame(can_id & 0x1FFFFFFF, payload[:length])
 
 
+class PythonCanTransport(Transport):
+    """Cross-platform CAN via the ``python-can`` library. Covers most bench
+    USB-CAN adapters (CANable/SLCAN, PCAN, Vector, Kvaser, USB2CAN, SocketCAN,
+    ...) through one API. ``interface``/``channel`` map to python-can's config,
+    e.g. interface="slcan" channel="COM5", or interface="pcan" channel="PCAN_USBBUS1".
+
+    Install with ``pip install python-can`` (optional). J1939 uses 29-bit
+    extended frames at 250 kbit/s by default.
+    """
+
+    protocol = "j1939"
+
+    def __init__(self, interface: str = "socketcan", channel: str = "can0",
+                 bitrate: int = 250000):
+        self.interface = interface
+        self.channel = channel
+        self.bitrate = bitrate
+        self._bus = None
+
+    def open(self) -> None:
+        import can                                       # noqa: PLC0415 (optional)
+        self._bus = can.Bus(interface=self.interface, channel=self.channel,
+                            bitrate=self.bitrate)
+
+    def close(self) -> None:
+        if self._bus is not None:
+            self._bus.shutdown()
+            self._bus = None
+
+    def send(self, data: bytes, can_id: int = 0) -> None:
+        import can                                       # noqa: PLC0415
+        if self._bus is None:
+            raise RuntimeError("transport not open")
+        self._bus.send(can.Message(arbitration_id=can_id, data=data,
+                                   is_extended_id=True))
+
+    def recv(self, timeout: float = 1.0) -> Optional[CanFrame]:
+        if self._bus is None:
+            raise RuntimeError("transport not open")
+        msg = self._bus.recv(timeout)
+        if msg is None:
+            return None
+        return CanFrame(msg.arbitration_id & 0x1FFFFFFF, bytes(msg.data))
+
+
 def list_backends() -> List[str]:
-    return ["Simulation", "RP1210 (J1939/J1708)", "J2534 (CAN)", "SocketCAN"]
+    return ["Simulation", "python-can (USB-CAN)", "RP1210 (J1939/J1708)",
+            "J2534 (CAN)", "SocketCAN"]
