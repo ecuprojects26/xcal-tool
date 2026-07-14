@@ -1,6 +1,6 @@
 # PyInstaller spec for a one-file Windows build of xcaltool.
 #
-# Build (on Windows, in the repo root):
+# Build (on Windows, from the repo root):
 #     py -3-32 -m pip install pyinstaller
 #     py -3-32 -m PyInstaller packaging/xcaltool.spec
 #
@@ -8,12 +8,19 @@
 # (NULN2R32.dll) is 32-bit and won't load into 64-bit Python. The resulting
 # dist/xcaltool.exe is a single self-contained file -- no Python install needed
 # on the target PC.
+#
+# Paths are resolved from the spec's own location so the build works no matter
+# what the current working directory is.
+
+import os
+
+root = os.path.abspath(os.path.join(SPECPATH, os.pardir))
 
 block_cipher = None
 
 a = Analysis(
-    ['../run.py'],
-    pathex=['../src'],
+    [os.path.join(root, 'run.py')],
+    pathex=[os.path.join(root, 'src')],
     binaries=[],
     datas=[],
     hiddenimports=['xcaltool'],
@@ -32,6 +39,6 @@ exe = EXE(
     name='xcaltool',
     debug=False,
     strip=False,
-    upx=True,
+    upx=False,
     console=False,          # GUI app; no console window
 )

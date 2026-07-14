@@ -2,8 +2,11 @@
 batch conversion, VIN decode and reporting."""
 
 import os
+import sys
 
-from xcaltool import (batch, calcompare, comms, j1939, livedata, report,
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+from xcaltool import (batch, calcompare, comms, j1939, livedata, report,  # noqa: E402
                       xcalfmt)
 
 

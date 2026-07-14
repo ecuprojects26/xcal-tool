@@ -1,0 +1,40 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up 32-bit Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: 'x86'   # 32-bit, so the Nexiq RP1210 DLL can load
+
+      - name: Install PyInstaller + test deps
+        run: python -m pip install --upgrade pip pyinstaller pytest
+
+      - name: Run tests
+        run: python -m pytest -q
+
+      - name: Build one-file exe
+        run: python -m PyInstaller --noconfirm packaging/xcaltool.spec
+
+      - name: Upload exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcaltool-windows-x86
+          path: dist/xcaltool.exe
+
+      - name: Attach exe to release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/xcaltool.exe
