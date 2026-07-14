@@ -139,6 +139,7 @@ class XcalBinTab(ttk.Frame):
                 f"  token       : {x.token}",
                 f"  image size  : {len(x.image):,} bytes (0x{len(x.image):X})",
                 f"  hex runs    : {len(x.runs)}",
+                self._hash_line(x.image),
                 "",
                 "Click 'xcal -> bin' to extract the raw flash image.",
             ]
@@ -148,6 +149,7 @@ class XcalBinTab(ttk.Frame):
             has = os.path.exists(sidecar)
             self._set_report(
                 f"Detected: raw .bin ({len(self._data):,} bytes)\n"
+                f"{self._hash_line(self._data)}\n"
                 f"Sidecar {'found' if has else 'NOT found'}: "
                 f"{os.path.basename(sidecar)}\n\n"
                 + ("Click 'bin -> xcal' to rebuild the .xcal."
@@ -155,6 +157,11 @@ class XcalBinTab(ttk.Frame):
                    "Extract this bin from its .xcal first so a .xcalmeta sidecar "
                    "exists, then bin -> xcal can rebuild it.")
             )
+
+    @staticmethod
+    def _hash_line(image: bytes) -> str:
+        h = report.image_hashes(image)
+        return f"  CRC32={h['crc32']}  SHA256={h['sha256']}"
 
     def xcal_to_bin(self):
         if not self._data:
@@ -786,6 +793,12 @@ class EcuTab(ttk.Frame):
             self._log(f"  MAKE/MODEL : {info.make} {info.model}".rstrip())
         if info.software:
             self._log(f"  SOFTWARE   : {', '.join(info.software)}")
+        vin = report.decode_vin(info.vin)
+        if vin:
+            chk = "ok" if vin["valid_check_digit"] == "yes" else "invalid"
+            self._log(f"  VIN DECODE : WMI {vin['wmi']} · year {vin['model_year']}"
+                      f" · plant {vin['plant']} · serial {vin['serial']}"
+                      f" · check digit {chk}")
 
     def read_codes(self):
         if not self._need_link():
@@ -955,7 +968,13 @@ class EcuTab(ttk.Frame):
         with open(path, "wb") as fh:
             fh.write(image)
         self._log(f"Saved raw image -> {path} ({len(image):,} bytes)")
+        self._log_hashes(image)
         self._offer_convert(image, path)
+
+    def _log_hashes(self, image, label="image"):
+        h = report.image_hashes(image)
+        self._log(f"  {label} integrity: size={h['size']} bytes  "
+                  f"CRC32={h['crc32']}  SHA256={h['sha256']}")
 
     def _offer_convert(self, image, bin_path):
         if not messagebox.askyesno(
@@ -1025,6 +1044,8 @@ class EcuTab(ttk.Frame):
         with open(bpath, "wb") as fh:
             fh.write(backup)
         self._log(f"Write verified OK. Pre-write backup saved -> {bpath}")
+        self._log_hashes(backup, label="backup")
+        self._log_hashes(image, label="written")
 
 
 def _load_security_module(path):
