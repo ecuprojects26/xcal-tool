@@ -843,24 +843,39 @@ class EcuTab(ttk.Frame):
         self._offer_convert(image, path)
 
     def _offer_convert(self, image, bin_path):
-        if messagebox.askyesno("Convert", "Also convert this image to an EFILive "
-                               "_efi.bin?\n(You'll pick a matching .xcal template "
-                               "for full .xcal rebuild separately.)"):
-            tpl = filedialog.askopenfilename(
-                title="Matching original .xcal (template for EFILive/xcal)",
-                filetypes=[("xcal", "*.xcal *.* ")])
-            if not tpl:
-                return
-            try:
-                with open(tpl, "rb") as fh:
-                    template = fh.read()
-                efi = xcalfmt.build_from_template(image, template)
-                out = os.path.splitext(bin_path)[0] + "_efi.bin"
-                with open(out, "wb") as fh:
-                    fh.write(efi)
-                self._log(f"Wrote EFILive image -> {out}")
-            except Exception as exc:
-                messagebox.showerror("Convert failed", str(exc))
+        if not messagebox.askyesno(
+                "Convert",
+                "Also convert this raw image to .xcal and EFILive _efi.bin?\n"
+                "(You'll pick the matching original .xcal as a template for the "
+                "header/token/layout.)"):
+            return
+        tpl = filedialog.askopenfilename(
+            title="Matching original .xcal (template)",
+            filetypes=[("xcal", "*.xcal"), ("all files", "*.*")])
+        if not tpl:
+            return
+        try:
+            with open(tpl, "rb") as fh:
+                template = fh.read()
+            base = os.path.splitext(bin_path)[0]
+            xcal = xcalfmt.build_from_template(image, template)
+            xpath = base + ".xcal"
+            with open(xpath, "wb") as fh:
+                fh.write(xcal)
+            self._log(f"Wrote .xcal -> {xpath} ({len(xcal):,} bytes)")
+            efi = xcalfmt.to_efi_bin(xcalfmt.parse(xcal))
+            epath = base + "_efi.bin"
+            with open(epath, "wb") as fh:
+                fh.write(efi)
+            self._log(f"Wrote EFILive _efi.bin -> {epath} ({len(efi):,} bytes)")
+            messagebox.showinfo(
+                "Done",
+                "Wrote .xcal and EFILive _efi.bin next to the raw image.\n\n"
+                "Note: the template's 4-char token was reused as-is (it can't be "
+                "recomputed), so if you changed bytes EFILive may need to "
+                "re-accept the file.")
+        except Exception as exc:
+            messagebox.showerror("Convert failed", str(exc))
 
     def write_image(self):
         flasher = self._build_flasher()

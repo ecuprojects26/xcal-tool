@@ -20,11 +20,26 @@ for J1708 that's a raw J1587 message. The diagnostic layer picks the protocol.
 from __future__ import annotations
 
 import abc
+import ctypes
 import os
 import queue
 import time
 from dataclasses import dataclass
 from typing import List, Optional
+
+
+class _PassThruMsg(ctypes.Structure):
+    """SAE J2534 PASSTHRU_MSG. For CAN the payload is the 4-byte CAN id
+    (big-endian) followed by the data bytes."""
+    _fields_ = [
+        ("ProtocolID", ctypes.c_ulong),
+        ("RxStatus", ctypes.c_ulong),
+        ("TxFlags", ctypes.c_ulong),
+        ("Timestamp", ctypes.c_ulong),
+        ("DataSize", ctypes.c_ulong),
+        ("ExtraDataIndex", ctypes.c_ulong),
+        ("Data", ctypes.c_ubyte * 4128),
+    ]
 
 
 @dataclass
@@ -227,10 +242,16 @@ class Rp1210Transport(Transport):
 # ---------------------------------------------------------------------------
 
 class J2534Transport(Transport):
-    """SAE J2534 pass-thru transport (CAN). Windows only, needs the device's
-    J2534 DLL. Structurally complete; not tested against hardware here."""
+    """SAE J2534 pass-thru transport (raw 29-bit CAN at 250 kbit/s for J1939).
+    Windows only, needs the device's J2534 DLL. This does raw CAN frames, so
+    the diagnostic layer performs J1939 Transport Protocol (BAM) itself.
+    Implemented to the J2534 API; verify against your device on the bench."""
 
     protocol = "j1939"
+
+    _CAN = 5                       # ProtocolID CAN
+    _CAN_29BIT_ID = 0x00000100     # TxFlags / RxStatus extended-id bit
+    _PASS_FILTER = 1
 
     def __init__(self, dll_path: str, baud: int = 250000):
         self.dll_path = dll_path
@@ -238,20 +259,50 @@ class J2534Transport(Transport):
         self._api = None
         self._device = None
         self._channel = None
+        self._filter = None
+
+    def _check(self, rc: int, what: str) -> None:
+        if rc != 0:
+            raise RuntimeError(f"{what} failed (J2534 error {rc})")
 
     def open(self) -> None:
-        import ctypes                                   # noqa: PLC0415 (optional)
-        self._api = ctypes.windll.LoadLibrary(self.dll_path)
+        try:
+            self._api = ctypes.windll.LoadLibrary(self.dll_path)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Could not load J2534 DLL {self.dll_path!r} ({exc}). "
+                "Install the adapter's J2534 driver; match Python bitness to "
+                "the DLL.")
         dev = ctypes.c_ulong()
-        if self._api.PassThruOpen(None, ctypes.byref(dev)) != 0:
-            raise RuntimeError("PassThruOpen failed")
+        self._check(self._api.PassThruOpen(None, ctypes.byref(dev)),
+                    "PassThruOpen")
         self._device = dev
         chan = ctypes.c_ulong()
-        CAN = 5
-        if self._api.PassThruConnect(dev, CAN, 0, self.baud,
-                                     ctypes.byref(chan)) != 0:
-            raise RuntimeError("PassThruConnect failed")
+        self._check(self._api.PassThruConnect(dev, self._CAN, self._CAN_29BIT_ID,
+                                              self.baud, ctypes.byref(chan)),
+                    "PassThruConnect")
         self._channel = chan
+        self._start_pass_filter()
+
+    def _start_pass_filter(self) -> None:
+        # Pass-all: mask 0 / pattern 0 so every frame is received.
+        mask = self._make_msg(0, b"\x00\x00\x00\x00")
+        patt = self._make_msg(0, b"\x00\x00\x00\x00")
+        fid = ctypes.c_ulong()
+        self._check(self._api.PassThruStartMsgFilter(
+            self._channel, self._PASS_FILTER,
+            ctypes.byref(mask), ctypes.byref(patt), None,
+            ctypes.byref(fid)), "PassThruStartMsgFilter")
+        self._filter = fid
+
+    def _make_msg(self, tx_flags: int, payload: bytes) -> _PassThruMsg:
+        msg = _PassThruMsg()
+        msg.ProtocolID = self._CAN
+        msg.TxFlags = tx_flags
+        msg.DataSize = len(payload)
+        for i, b in enumerate(payload):
+            msg.Data[i] = b
+        return msg
 
     def close(self) -> None:
         if self._api and self._channel is not None:
@@ -262,12 +313,28 @@ class J2534Transport(Transport):
             self._device = None
 
     def send(self, data: bytes, can_id: int = 0) -> None:
-        raise NotImplementedError(
-            "J2534 send needs PASSTHRU_MSG marshalling; complete on hardware.")
+        if self._api is None or self._channel is None:
+            raise RuntimeError("transport not open")
+        payload = (can_id & 0x1FFFFFFF).to_bytes(4, "big") + data
+        msg = self._make_msg(self._CAN_29BIT_ID, payload)
+        count = ctypes.c_ulong(1)
+        self._check(self._api.PassThruWriteMsgs(
+            self._channel, ctypes.byref(msg), ctypes.byref(count), 100),
+            "PassThruWriteMsgs")
 
     def recv(self, timeout: float = 1.0) -> Optional[CanFrame]:
-        raise NotImplementedError(
-            "J2534 recv needs PASSTHRU_MSG marshalling; complete on hardware.")
+        if self._api is None or self._channel is None:
+            raise RuntimeError("transport not open")
+        msg = _PassThruMsg()
+        count = ctypes.c_ulong(1)
+        rc = self._api.PassThruReadMsgs(
+            self._channel, ctypes.byref(msg), ctypes.byref(count),
+            int(timeout * 1000))
+        if rc != 0 or count.value == 0 or msg.DataSize < 4:
+            return None
+        raw = bytes(msg.Data[:msg.DataSize])
+        can_id = int.from_bytes(raw[:4], "big")
+        return CanFrame(can_id, raw[4:])
 
 
 # ---------------------------------------------------------------------------

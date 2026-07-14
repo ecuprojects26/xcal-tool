@@ -14,6 +14,7 @@ seed/key unlock that is Cummins-proprietary; that is a pluggable slot
 from __future__ import annotations
 
 import abc
+import time
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
@@ -94,15 +95,19 @@ class DiagnosticLink:
             for cid, frame in j1939.build_tp_bam(pgn, body, self.source, priority):
                 self.transport.send(frame, cid)
 
-    def _collect(self, pgn: int, timeout: float = 1.0) -> Optional[bytes]:
+    def _collect(self, pgn: int, timeout: float = 1.0,
+                 src: Optional[int] = None) -> Optional[bytes]:
         """Read frames until ``pgn`` arrives, reassembling BAM multi-packet
-        responses when the data exceeds 8 bytes."""
+        responses when the data exceeds 8 bytes. When ``src`` is given, only
+        frames from that source address are accepted (ignore other bus nodes)."""
         bam_total = 0
         bam_buf = bytearray()
         for _ in range(4096):
             frame = self.transport.recv(timeout)
             if frame is None:
                 return None
+            if src is not None and (frame.can_id & 0xFF) != src:
+                continue                                    # different ECU; skip
             fpgn = j1939.canid_to_pgn(frame.can_id)
             if fpgn == pgn:                                 # single-frame answer
                 return frame.data
@@ -420,15 +425,32 @@ class J1939Flasher:
     def identify(self) -> EcuInfo:
         return self.link.identify()
 
+    # -- DM15 handshake ----------------------------------------------------
+    def _await_dm15(self, max_wait: float = 10.0) -> Optional[dict]:
+        """Collect a DM15 from the engine, tolerating BUSY. Per J1939-73 the
+        ECU may answer a memory request with status=BUSY and then send another
+        DM15 (PROCEED / OP_COMPLETED / OP_FAILED) when ready; keep reading
+        until a non-BUSY DM15 arrives or ``max_wait`` elapses."""
+        deadline = time.monotonic() + max_wait
+        while time.monotonic() < deadline:
+            resp = self.link._collect(j1939.PGN_DM15, self.timeout,
+                                      src=j1939.ENGINE_ADDRESS)
+            if resp is None:
+                return None
+            st = j1939.decode_dm15(resp)
+            if st["status"] == j1939.STATUS_BUSY:
+                continue
+            return st
+        return None
+
     # -- security ----------------------------------------------------------
     def unlock(self) -> None:
         self.link._send_pgn(j1939.PGN_DM14,
                             j1939.encode_dm14(0, j1939.CMD_STATUS_REQUEST, 0),
                             dest=j1939.ENGINE_ADDRESS)
-        resp = self.link._collect(j1939.PGN_DM15, self.timeout)
-        if resp is None:
+        st = self._await_dm15()
+        if st is None:
             raise SecurityError("no DM15 response to status request")
-        st = j1939.decode_dm15(resp)
         if st["seed"] == 0 and st["status"] == j1939.STATUS_PROCEED:
             return                                          # already unlocked
         if self.security is None:
@@ -439,8 +461,8 @@ class J1939Flasher:
         self.link._send_pgn(j1939.PGN_DM14,
                             j1939.encode_dm14(0, j1939.CMD_STATUS_REQUEST, 0, key=key),
                             dest=j1939.ENGINE_ADDRESS)
-        resp = self.link._collect(j1939.PGN_DM15, self.timeout)
-        if resp is None or j1939.decode_dm15(resp)["status"] != j1939.STATUS_PROCEED:
+        st = self._await_dm15()
+        if st is None or st["status"] != j1939.STATUS_PROCEED:
             raise SecurityError("unlock rejected (wrong key)")
 
     # -- read --------------------------------------------------------------
@@ -452,10 +474,11 @@ class J1939Flasher:
             self.link._send_pgn(j1939.PGN_DM14,
                                 j1939.encode_dm14(n, j1939.CMD_READ, address + done),
                                 dest=j1939.ENGINE_ADDRESS)
-            r = self.link._collect(j1939.PGN_DM15, self.timeout)
-            if r is None or j1939.decode_dm15(r)["status"] != j1939.STATUS_PROCEED:
+            st = self._await_dm15()
+            if st is None or st["status"] != j1939.STATUS_PROCEED:
                 raise IOError("read denied at 0x%08X" % (address + done))
-            d = self.link._collect(j1939.PGN_DM16, self.timeout)
+            d = self.link._collect(j1939.PGN_DM16, self.timeout,
+                                   src=j1939.ENGINE_ADDRESS)
             if d is None:
                 raise IOError("no data at 0x%08X" % (address + done))
             out += j1939.decode_dm16(d)
@@ -486,8 +509,8 @@ class J1939Flasher:
         self.link._send_pgn(j1939.PGN_DM14,
                             j1939.encode_dm14(len(data), j1939.CMD_ERASE, address),
                             dest=j1939.ENGINE_ADDRESS)
-        r = self.link._collect(j1939.PGN_DM15, self.timeout)
-        if r is None or j1939.decode_dm15(r)["status"] not in (
+        st = self._await_dm15()
+        if st is None or st["status"] not in (
                 j1939.STATUS_OP_COMPLETED, j1939.STATUS_PROCEED):
             raise IOError("erase denied at 0x%08X" % address)
         done = 0
@@ -497,13 +520,13 @@ class J1939Flasher:
             self.link._send_pgn(j1939.PGN_DM14,
                                 j1939.encode_dm14(n, j1939.CMD_WRITE, address + done),
                                 dest=j1939.ENGINE_ADDRESS)
-            r = self.link._collect(j1939.PGN_DM15, self.timeout)
-            if r is None or j1939.decode_dm15(r)["status"] != j1939.STATUS_PROCEED:
+            st = self._await_dm15()
+            if st is None or st["status"] != j1939.STATUS_PROCEED:
                 raise IOError("write denied at 0x%08X" % (address + done))
             self.link._send_pgn(j1939.PGN_DM16, j1939.encode_dm16(chunk),
                                 dest=j1939.ENGINE_ADDRESS)
-            r = self.link._collect(j1939.PGN_DM15, self.timeout)
-            if r is None or j1939.decode_dm15(r)["status"] != j1939.STATUS_OP_COMPLETED:
+            st = self._await_dm15()
+            if st is None or st["status"] != j1939.STATUS_OP_COMPLETED:
                 raise IOError("write not confirmed at 0x%08X" % (address + done))
             done += n
             if progress:

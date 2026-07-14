@@ -108,6 +108,46 @@ def test_simulation_flash_read_write_verify():
     flasher.disconnect()
 
 
+def test_flasher_handles_dm15_busy():
+    # ECU answers the unlock status-request with BUSY first, then PROCEED.
+    eng = j1939.ENGINE_ADDRESS
+    busy = transport.CanFrame(
+        j1939.pgn_to_canid(j1939.PGN_DM15, eng),
+        j1939.encode_dm15(0, j1939.STATUS_BUSY))
+    proceed = transport.CanFrame(
+        j1939.pgn_to_canid(j1939.PGN_DM15, eng),
+        j1939.encode_dm15(0, j1939.STATUS_PROCEED, seed=0))
+
+    def responder(frame):
+        return [busy, proceed]
+
+    t = transport.SimulationTransport(responder=responder)
+    link = comms.DiagnosticLink(t)
+    flasher = comms.J1939Flasher(link, modules.get_profile("CM2450"),
+                                 security=comms.DemoSecurityProvider(),
+                                 timeout=0.2)
+    flasher.connect()
+    flasher.unlock()          # must not raise: waits past BUSY for PROCEED
+    flasher.disconnect()
+
+
+def test_collect_ignores_other_sources():
+    # A frame from another node (source 0x17) must not satisfy a read from 0x00.
+    other = transport.CanFrame(
+        j1939.pgn_to_canid(j1939.PGN_DM15, 0x17),
+        j1939.encode_dm15(0, j1939.STATUS_PROCEED))
+
+    def responder(frame):
+        return [other]
+
+    t = transport.SimulationTransport(responder=responder)
+    link = comms.DiagnosticLink(t)
+    with link:
+        got = link._collect(j1939.PGN_DM15, timeout=0.05,
+                            src=j1939.ENGINE_ADDRESS)
+    assert got is None
+
+
 def test_flash_locked_without_security():
     flasher = comms.simulation_flasher()
     flasher.security = None                            # no key provider
