@@ -52,6 +52,9 @@ def test_simulation_identify_read_clear():
     with link:
         info = link.identify()
         assert info.make == "Cummins"
+        assert info.vin == "3C63R3EL8KG512345"
+        assert info.serial == "79512345"
+        assert "51.19.09.02" in info.calibration_id
         active = link.read_dtcs(active=True)
         assert len(active) == 2
         assert any(d.spn == 3251 for d in active)

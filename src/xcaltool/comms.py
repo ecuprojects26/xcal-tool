@@ -25,8 +25,9 @@ from .transport import CanFrame, SimulationTransport, Transport
 class EcuInfo:
     ecm_code: str = ""
     part_number: str = ""
-    calibration_id: str = ""
-    serial: str = ""
+    calibration_id: str = ""     # calibration / ECFG version
+    serial: str = ""             # engine serial number (ESN)
+    vin: str = ""
     make: str = ""
     model: str = ""
     software: List[str] = field(default_factory=list)
@@ -101,6 +102,15 @@ class DiagnosticLink:
                 c = j1939.decode_component_id(comp)
                 info.make, info.model = c["make"], c["model"]
                 info.serial = c["serial"]
+            vin = self._request_pgn(j1939.PGN_VEHICLE_ID)
+            if vin:
+                info.vin = j1939.decode_vin(vin)
+            ecu = self._request_pgn(j1939.PGN_ECU_ID)
+            if ecu:
+                e = j1939.decode_ecu_id(ecu)
+                info.part_number = e["part_number"]
+                if e["serial"] and not info.serial:
+                    info.serial = e["serial"]
             soft = self._request_pgn(j1939.PGN_SOFTWARE_ID)
             if soft:
                 info.software = j1939.decode_software_id(soft)
@@ -188,6 +198,9 @@ class SimulatedEcu:
     def __init__(self):
         self.component_id = b"Cummins*CM2450*79512345*UNIT01"
         self.software_id = b"\x01CHR-CC-DP-MY19-V51.19.09.02*"
+        self.vin = b"3C63R3EL8KG512345*"
+        # ECU part#*serial*location*type*manufacturer
+        self.ecu_id = b"4353993*79512345*Engine*ECM*Cummins*"
         self.active = [
             j1939.J1939Dtc(spn=3251, fmi=2, occurrence_count=5),   # DPF pressure
             j1939.J1939Dtc(spn=1569, fmi=31, occurrence_count=1),  # fuel derate
@@ -207,6 +220,10 @@ class SimulatedEcu:
 
         if pgn == j1939.PGN_COMPONENT_ID:
             return [reply(pgn, self.component_id)]
+        if pgn == j1939.PGN_VEHICLE_ID:
+            return [reply(pgn, self.vin)]
+        if pgn == j1939.PGN_ECU_ID:
+            return [reply(pgn, self.ecu_id)]
         if pgn == j1939.PGN_SOFTWARE_ID:
             return [reply(pgn, self.software_id)]
         if pgn == j1939.PGN_DM1:

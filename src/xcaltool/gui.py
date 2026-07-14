@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import os
 import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox, ttk
 
 import json
 
@@ -566,10 +566,13 @@ class EcuTab(ttk.Frame):
         row = ttk.Frame(self)
         row.pack(fill="x")
         ttk.Label(row, text="Adapter:").pack(side="left")
-        self.backend = tk.StringVar(value="Simulation")
-        ttk.Combobox(row, textvariable=self.backend, width=20, state="readonly",
-                     values=transport.list_backends()).pack(side="left", padx=6)
-        ttk.Label(row, text="Protocol:").pack(side="left")
+        self._adapters = []
+        self.backend = tk.StringVar()
+        self.adapter_box = ttk.Combobox(row, textvariable=self.backend, width=32,
+                                        state="readonly")
+        self.adapter_box.pack(side="left", padx=6)
+        ttk.Button(row, text="Rescan", command=self.rescan).pack(side="left")
+        ttk.Label(row, text="Protocol:").pack(side="left", padx=(12, 0))
         self.proto = tk.StringVar(value="j1939")
         ttk.Combobox(row, textvariable=self.proto, width=8, state="readonly",
                      values=["j1939", "j1587"]).pack(side="left", padx=6)
@@ -596,47 +599,41 @@ class EcuTab(ttk.Frame):
 
         self.out = tk.Text(self, height=20, wrap="none", font=("Courier", 9))
         self.out.pack(fill="both", expand=True, pady=8)
+        self.rescan()
 
     def _log(self, text):
         self.out.insert("end", text + "\n")
         self.out.see("end")
 
+    def rescan(self):
+        self._adapters = transport.discover_adapters()
+        labels = [a.label for a in self._adapters]
+        self.adapter_box.config(values=labels)
+        if labels:
+            self.backend.set(labels[0])
+        extra = len(self._adapters) - 1
+        self._log(f"Found {extra} hardware adapter(s) + simulation." if extra
+                  else "No hardware adapters found; simulation available.")
+
+    def _selected_adapter(self):
+        label = self.backend.get()
+        for a in self._adapters:
+            if a.label == label:
+                return a
+        return None
+
     def _build_link(self):
-        name = self.backend.get()
+        adapter = self._selected_adapter()
+        if adapter is None:
+            messagebox.showinfo("xcaltool", "Pick an adapter (or press Rescan).")
+            return None
         proto = self.proto.get()
-        if name == "Simulation":
-            if proto != "j1939":
-                messagebox.showinfo("xcaltool", "Simulation currently models a "
-                                    "J1939 ECM. Switch protocol to j1939.")
-                return None
-            return comms.simulation_link()
-        if name.startswith("python-can"):
-            iface = simpledialog.askstring(
-                "python-can", "Interface (socketcan / slcan / pcan / kvaser / "
-                "vector / usb2can):", initialvalue="slcan")
-            if not iface:
-                return None
-            chan = simpledialog.askstring(
-                "python-can", "Channel (e.g. can0, COM5, PCAN_USBBUS1):",
-                initialvalue="COM5")
-            if not chan:
-                return None
-            t = transport.PythonCanTransport(interface=iface, channel=chan)
-        elif name.startswith("RP1210"):
-            dll = simpledialog.askstring("RP1210", "Vendor DLL name (e.g. NULN2R32):")
-            if not dll:
-                return None
-            t = transport.Rp1210Transport(dll, protocol=proto)
-        elif name.startswith("J2534"):
-            dll = filedialog.askopenfilename(title="J2534 DLL", filetypes=[("DLL", "*.dll")])
-            if not dll:
-                return None
-            t = transport.J2534Transport(dll)
-        else:
-            chan = simpledialog.askstring("SocketCAN", "CAN interface:", initialvalue="can0")
-            if not chan:
-                return None
-            t = transport.SocketCanTransport(chan)
+        if adapter.kind == "simulation" and proto != "j1939":
+            messagebox.showinfo("xcaltool", "Simulation currently models a "
+                                "J1939 ECM. Switch protocol to j1939.")
+            return None
+        adapter.protocol = proto
+        t = adapter.make()
         t.protocol = proto
         return comms.DiagnosticLink(t)
 
@@ -674,11 +671,14 @@ class EcuTab(ttk.Frame):
             messagebox.showerror("Identify failed", str(exc))
             return
         self._log("-- ECU identity --")
-        self._log(f"  make/model : {info.make} {info.model}".rstrip())
-        self._log(f"  serial     : {info.serial}")
-        self._log(f"  calibration: {info.calibration_id}")
+        self._log(f"  VIN            : {info.vin}")
+        self._log(f"  ESN (serial)   : {info.serial}")
+        self._log(f"  ECFG/cal version: {info.calibration_id}")
+        self._log(f"  make/model     : {info.make} {info.model}".rstrip())
+        if info.part_number:
+            self._log(f"  ECU part no.   : {info.part_number}")
         if info.software:
-            self._log(f"  software   : {', '.join(info.software)}")
+            self._log(f"  software       : {', '.join(info.software)}")
 
     def read_codes(self):
         if not self._need_link():

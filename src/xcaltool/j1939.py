@@ -26,6 +26,8 @@ PGN_DM3 = 65228             # 0xFECC  clear previously active DTCs
 PGN_DM11 = 65235            # 0xFED3  clear active DTCs
 PGN_COMPONENT_ID = 65259    # 0xFEEB  Make*Model*Serial*Unit
 PGN_SOFTWARE_ID = 65242     # 0xFEDA
+PGN_VEHICLE_ID = 65260      # 0xFEEC  VIN
+PGN_ECU_ID = 64965          # 0xFDC5  ECU part#*serial*location*type*mfr
 
 GLOBAL_ADDRESS = 0xFF
 ENGINE_ADDRESS = 0x00       # Cummins engine ECM default source address
@@ -118,6 +120,17 @@ def decode_component_id(data: bytes) -> dict:
     keys = ["make", "model", "serial", "unit"]
     text = [f.decode("latin-1", "replace").strip("\x00 ") for f in fields]
     return {k: (text[i] if i < len(text) else "") for i, k in enumerate(keys)}
+
+
+def decode_vin(data: bytes) -> str:
+    return data.split(b"*")[0].decode("latin-1", "replace").strip("\x00 ")
+
+
+def decode_ecu_id(data: bytes) -> dict:
+    fields = [f.decode("latin-1", "replace").strip("\x00 ")
+              for f in data.split(b"*")]
+    keys = ["part_number", "serial", "location", "type", "manufacturer"]
+    return {k: (fields[i] if i < len(fields) else "") for i, k in enumerate(keys)}
 
 
 def decode_software_id(data: bytes) -> List[str]:

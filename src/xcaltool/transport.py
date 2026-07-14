@@ -20,6 +20,7 @@ for J1708 that's a raw J1587 message. The diagnostic layer picks the protocol.
 from __future__ import annotations
 
 import abc
+import os
 import queue
 from dataclasses import dataclass
 from typing import List, Optional
@@ -276,6 +277,127 @@ class PythonCanTransport(Transport):
         if msg is None:
             return None
         return CanFrame(msg.arbitration_id & 0x1FFFFFFF, bytes(msg.data))
+
+
+# ---------------------------------------------------------------------------
+# Adapter discovery -- populate the GUI dropdown with what's actually installed
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Adapter:
+    """A concrete, ready-to-open transport choice for the dropdown."""
+    label: str
+    kind: str                 # simulation | pythoncan | rp1210 | j2534 | socketcan
+    interface: str = ""
+    channel: str = ""
+    dll: str = ""
+    protocol: str = "j1939"
+
+    def make(self) -> Transport:
+        if self.kind == "simulation":
+            from . import comms                          # noqa: PLC0415
+            return comms.SimulationTransport(responder=comms.SimulatedEcu().respond)
+        if self.kind == "pythoncan":
+            return PythonCanTransport(interface=self.interface, channel=self.channel)
+        if self.kind == "rp1210":
+            return Rp1210Transport(self.dll, protocol=self.protocol)
+        if self.kind == "j2534":
+            return J2534Transport(self.dll)
+        if self.kind == "socketcan":
+            return SocketCanTransport(self.channel)
+        raise ValueError(f"unknown adapter kind {self.kind!r}")
+
+
+def _discover_pythoncan() -> List[Adapter]:
+    out: List[Adapter] = []
+    try:
+        import can                                        # noqa: PLC0415
+        for cfg in can.interface.detect_available_configs():
+            iface = cfg.get("interface", "")
+            chan = str(cfg.get("channel", ""))
+            out.append(Adapter(
+                label=f"{iface}:{chan} (python-can)",
+                kind="pythoncan", interface=iface, channel=chan))
+    except Exception:                                     # library missing / probe error
+        pass
+    return out
+
+
+def _discover_rp1210() -> List[Adapter]:
+    out: List[Adapter] = []
+    try:
+        import configparser                               # noqa: PLC0415
+        windir = os.environ.get("WINDIR", r"C:\Windows")
+        root = configparser.ConfigParser()
+        root.read(os.path.join(windir, "RP121032.ini"))
+        vendors = root.get("RP1210Support", "APIImplementations", fallback="")
+        for name in [v.strip() for v in vendors.split(",") if v.strip()]:
+            vp = configparser.ConfigParser()
+            vp.read(os.path.join(windir, name + ".ini"))
+            vname = vp.get("VendorInformation", "Name", fallback=name)
+            for sect in vp.sections():
+                if sect.lower().startswith("deviceinformation"):
+                    dev = vp.get(sect, "DeviceDescription",
+                                 fallback=vp.get(sect, "DeviceName", fallback=""))
+                    out.append(Adapter(
+                        label=f"{vname} - {dev} (RP1210)".replace(" - ", " ", 0),
+                        kind="rp1210", dll=name))
+            if not any(a.dll == name for a in out):
+                out.append(Adapter(label=f"{vname} (RP1210)", kind="rp1210", dll=name))
+    except Exception:
+        pass
+    return out
+
+
+def _discover_j2534() -> List[Adapter]:
+    out: List[Adapter] = []
+    try:
+        import winreg                                     # noqa: PLC0415
+        for hive_path in (r"SOFTWARE\WOW6432Node\PassThruSupport.04.04",
+                          r"SOFTWARE\PassThruSupport.04.04"):
+            try:
+                base = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, hive_path)
+            except OSError:
+                continue
+            i = 0
+            while True:
+                try:
+                    sub = winreg.EnumKey(base, i)
+                except OSError:
+                    break
+                i += 1
+                try:
+                    k = winreg.OpenKey(base, sub)
+                    name = winreg.QueryValueEx(k, "Name")[0]
+                    dll = winreg.QueryValueEx(k, "FunctionLibrary")[0]
+                    out.append(Adapter(label=f"{name} (J2534)", kind="j2534", dll=dll))
+                except OSError:
+                    continue
+    except Exception:
+        pass
+    return out
+
+
+def _discover_socketcan() -> List[Adapter]:
+    out: List[Adapter] = []
+    net = "/sys/class/net"
+    try:
+        for iface in sorted(os.listdir(net)):
+            if iface.startswith(("can", "vcan", "slcan")):
+                out.append(Adapter(label=f"{iface} (SocketCAN)",
+                                   kind="socketcan", channel=iface))
+    except OSError:
+        pass
+    return out
+
+
+def discover_adapters() -> List[Adapter]:
+    """Scan the machine for usable adapters. Simulation is always first."""
+    adapters = [Adapter(label="Simulation (no hardware)", kind="simulation")]
+    for finder in (_discover_pythoncan, _discover_socketcan,
+                   _discover_rp1210, _discover_j2534):
+        adapters.extend(finder())
+    return adapters
 
 
 def list_backends() -> List[str]:
